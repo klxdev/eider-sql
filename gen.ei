@@ -18,7 +18,7 @@ fn s(x: str) -> String { String.from(x) }
 
 
 fn keyword(w: String) -> bool {
-    let words = List["as", "assert", "break", "comptime", "const", "continue", "else", "export", "extern", "false", "fn", "for", "if", "impl", "import", "in", "inout", "let", "match", "module", "null", "pub", "return", "test", "trait", "true", "type", "unsafe", "uses", "var", "while", "mut", "self", "Self"]
+    let words = List["as", "assert", "break", "comptime", "const", "continue", "else", "export", "extern", "false", "fn", "for", "if", "impl", "import", "in", "inout", "let", "match", "module", "null", "pub", "return", "test", "trait", "true", "type", "unsafe", "uses", "while", "mut", "self", "Self"]
     for x in words { if w == s(x) { return true } }
     false
 }

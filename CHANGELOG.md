@@ -3,6 +3,10 @@
 eider-sql's versions (semver). Before 1.0 the MAJOR.MINOR is the Eider toolchain's it goes
 with (`eider` in eider.toml), the PATCH its own.
 
+## Unreleased
+
+- Use `let mut` instead of the removed `var` (eider-lang#2).
+
 ## 0.7.0
 
 First version, for Eider 0.7 (eider-lang issue 104): checked SQL on eider-postgres.
