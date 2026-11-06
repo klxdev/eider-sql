@@ -5,11 +5,11 @@ eider = "0.7"
 main = "bin/main.ei"
 description = "Checked SQL for Eider: a migration runner, a DDL and query checker with no database, a generator of typed query modules (eider-sql gen), a batch loader and a typed builder for dynamic SQL, on eider-postgres (docs/design.md)"
 
-# The PostgreSQL client. A path dependency until eider-postgres (itself on path dependencies for eider-tls
-# and crypto) is consumable through its repository: scripts/env.sh links ../eider-postgres (or
-# $EIDER_POSTGRES) at target/deps/postgres.
+# The PostgreSQL client (a release of eider-postgres whose dependencies on eider-tls and on the
+# toolchain's crypto package are the git and toolchain ones: its changelog).
 [deps.postgres]
-path = "target/deps/postgres"
+git = "https://github.com/klxdev/eider-postgres.git"
+version = "0.7.1"
 uses = ["net", "io", "clock", "fs"]
 
 # The command line of the eider-sql program (main.ei).

@@ -26,7 +26,7 @@
 # $toolchain/.vendor/<name> (fetched there and hash-checked by its scripts/vendor.sh on first
 # use). A dependency with none of these is fetched from its repository (network).
 # DEPS: the git packages in this repository's dependency graph (transitive ones included).
-DEPS="command"
+DEPS="command postgres tls"
 
 die() { echo "$(basename "$0"): $*" >&2; exit 2; }
 install_hint="install eider (gh release download --repo klxdev/eider-lang --pattern install.sh && sh install.sh --toolchain; eider-lang's docs/site/tooling/eider.md), or set EIDER_TOOLCHAIN to an Eider toolchain or an eider-lang checkout"
@@ -90,26 +90,6 @@ for d in $DEPS; do
 done
 export EIDER_PKG_OVERRIDE
 
-# eider-postgres is a path dependency until it, eider-tls and crypto can be fetched from their
-# repositories (eider-pkg refuses a package from a repository that has a path dependency). Linked
-# at target/deps:
-#   target/deps/postgres      -> $EIDER_POSTGRES, else ../eider-postgres (a checkout of it)
-# and, for that checkout's own path dependencies (its eider.toml), the same links its
-# scripts/env.sh makes inside it:
-#   <postgres>/target/deps/tls     -> $EIDER_TLS, else ../eider-tls
-#   <tls>/target/deps/crypto       -> $toolchain/packages/crypto
-# (build outputs inside those checkouts, ignored by their .gitignore).
-pg_dir=${EIDER_POSTGRES:-$here/../eider-postgres}
-[ -f "$pg_dir/eider.toml" ] || die "no eider-postgres checkout at $pg_dir (set EIDER_POSTGRES): it is a path dependency until it is published"
-pg_dir=$(cd "$pg_dir" && pwd -P)
-tls_dir=${EIDER_TLS:-$pg_dir/../eider-tls}
-[ -f "$tls_dir/eider.toml" ] || die "no eider-tls checkout at $tls_dir (set EIDER_TLS)"
-tls_dir=$(cd "$tls_dir" && pwd -P)
-if [ -d "$toolchain/packages/crypto" ]; then
-  mkdir -p "$here/target/deps" "$pg_dir/target/deps" "$tls_dir/target/deps"
-  ln -sfn "$pg_dir" "$here/target/deps/postgres"
-  ln -sfn "$tls_dir" "$pg_dir/target/deps/tls"
-  ln -sfn "$toolchain/packages/crypto" "$tls_dir/target/deps/crypto"
-else
-  die "$toolchain has no packages/crypto: eider-sql needs an eider-lang checkout as its toolchain (EIDER_TOOLCHAIN) until the crypto package is published"
-fi
+# crypto is the toolchain's own package (eider-postgres's `[deps.crypto] toolchain = true`, Eider
+# 0.7.6 and later: the toolchain's packages/crypto and its libeider_crypto backend): nothing to link.
+[ -d "$toolchain/packages/crypto" ] || die "$toolchain ($chosen) is Eider $theirs, which does not ship packages/crypto; eider-$pkg_name $mine needs Eider 0.7.6 or later (\`eider toolchain install 0.7\`)"
