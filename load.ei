@@ -1,0 +1,87 @@
+//! sql.load: loading related rows without N+1. `load_many` runs one query for a whole list of keys
+//! (`WHERE user_id = ANY($1)`) instead of one query per key, and `group_by` turns the rows into a map by key.
+//!
+//! ```
+//! let users = users.list_active(inout c, 18, 100, dl)?
+//! let ids = load.ints(users.map(|u| u.id))
+//! let orders = load.load_many_by[OrdersByUsersRow, i64](inout c, ORDERS_BY_USERS_SQL, ids, |o| o.user_id, dl)?
+//! // orders.get(user.id) is that user's rows; a user without orders is simply absent from the map
+//! ```
+//!
+//! The SQL must take the key list as its one parameter `$1` (an array). The keys go in chunks of `chunk_size`
+//! (5000 by default) so a list of any length stays a few round trips. Rows come back in the order the chunks
+//! return them; sort in the query (`ORDER BY`) when the order matters.
+
+import std.serial
+import std.strings
+import std.time
+import postgres
+import postgres.client
+import postgres.typed
+
+/// The keys of `xs` as `postgres.Value`s.
+pub fn ints(xs: List[i64]) -> List[postgres.Value] {
+    let mut out: List[postgres.Value] = List.new()
+    for x in xs { out.push(postgres.Int(x)) }
+    out
+}
+
+pub fn texts(xs: List[String]) -> List[postgres.Value] {
+    let mut out: List[postgres.Value] = List.new()
+    for x in xs { out.push(postgres.Text(x.copy())) }
+    out
+}
+
+pub fn uuids(xs: List[String]) -> List[postgres.Value] {
+    let mut out: List[postgres.Value] = List.new()
+    for x in xs { out.push(postgres.Uuid(x.copy())) }
+    out
+}
+
+pub const DEFAULT_CHUNK: usize = 5000
+
+/// Runs `sql` (with the key array as `$1`) once per chunk of `chunk_size` keys and returns every row as a `T`.
+/// No keys: no query.
+pub fn load_many_chunked[T: serial.Deserialize, A: strings.Text](inout c: client.Conn, sql: A, keys: List[postgres.Value], chunk_size: usize, dl: time.Deadline) -> Result[List[T], postgres.Error] uses net, io, clock {
+    let text = sql.text()
+    if !strings.contains(text.copy(), "$1") {
+        return Err(postgres.fail(postgres.Usage, "load_many: the SQL must take the key array as $1"))
+    }
+    let size = if chunk_size == 0 { DEFAULT_CHUNK } else { chunk_size }
+    let mut out: List[T] = List.new()
+    let mut at: usize = 0
+    while at < keys.len() {
+        let mut end = at + size
+        if end > keys.len() { end = keys.len() }
+        let part = keys.slice(at, end)
+        let rows = typed.query[T](inout c, text.copy(), List[postgres.Array(part)], dl)?
+        for r in rows { out.push(r) }
+        at = end
+    }
+    Ok(out)
+}
+
+pub fn load_many[T: serial.Deserialize, A: strings.Text](inout c: client.Conn, sql: A, keys: List[postgres.Value], dl: time.Deadline) -> Result[List[T], postgres.Error] uses net, io, clock {
+    load_many_chunked[T, A](inout c, sql, keys, DEFAULT_CHUNK, dl)
+}
+
+/// The rows grouped by the key `key` picks from each, in the order they came.
+pub fn group_by[T: Copy, K: Hash + Eq + Copy](rows: List[T], key: fn(T) -> K) -> Map[K, List[T]] {
+    let mut out: Map[K, List[T]] = Map.new()
+    for r in rows {
+        let k = key(r.copy())
+        let mut cur: List[T] = match out.get(k.copy()) {
+            Some(l) => l
+            None => List.new()
+        }
+        cur.push(r)
+        out.insert(k, cur)
+    }
+    out
+}
+
+/// `load_many` and `group_by`: one query per chunk of keys and the rows by key.
+pub fn load_many_by[T: serial.Deserialize + Copy, K: Hash + Eq + Copy, A: strings.Text](inout c: client.Conn, sql: A, keys: List[postgres.Value], key: fn(T) -> K, dl: time.Deadline) -> Result[Map[K, List[T]], postgres.Error] uses net, io, clock {
+    let rows = load_many[T, A](inout c, sql, keys, dl)?
+    Ok(group_by(rows, key))
+}

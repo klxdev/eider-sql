@@ -1,0 +1,441 @@
+//! sql.build: a small typed builder for SQL that is not known until the program runs: optional filters, a sort
+//! column chosen by the caller, a page, a batch insert. It is not an ORM: no relations, no entities, no state.
+//!
+//! ```
+//! let b = build.select(String.from("users"), build.names(List["id", "email"]))
+//!     .where_eq(String.from("active"), postgres.Bool(true))
+//!     .where_in(String.from("id"), load.ints(ids))
+//!     .order_by_allowed(requested_column, build.Desc, build.names(List["id", "created_at"]))
+//!     .limit(50)
+//! let built = b.build()?                  // built.sql, built.params
+//! let users = build.query[UserRow](inout c, built, dl)?
+//! ```
+//!
+//! Injection-safe by construction: every value is a bound parameter (`$1`, `$2`, ...), never part of the text;
+//! every identifier (table, column) must be a plain name (letters, digits, `_`, at most 63) and is written quoted;
+//! operators and directions are enum values; `order_by_allowed` takes the column from a list the program
+//! wrote, so a request cannot name anything else; `with_schema` additionally checks tables and columns against the
+//! schema the migrations build, so a typo is an error where the query is built. A problem anywhere in a chain is
+//! remembered and returned by `build()` (nothing is half-built). `UPDATE` and `DELETE` without a condition are
+//! refused unless `all_rows()` says so.
+
+import std.serial
+import std.strings
+import std.time
+import postgres
+import postgres.client
+import postgres.typed
+import sql
+import sql.schema
+
+fn s(x: str) -> String { String.from(x) }
+
+pub type Dir =
+    | Asc
+    | Desc
+
+pub type Cmp =
+    | Eq
+    | Ne
+    | Lt
+    | Le
+    | Gt
+    | Ge
+    | Like
+    | ILike
+
+fn cmp_text(c: Cmp) -> str {
+    match c {
+        Eq => "="
+        Ne => "<>"
+        Lt => "<"
+        Le => "<="
+        Gt => ">"
+        Ge => ">="
+        Like => "LIKE"
+        ILike => "ILIKE"
+    }
+}
+
+const K_COMPARE: u8 = 0
+const K_ANY: u8 = 1
+const K_NULL: u8 = 2
+const K_NOT_NULL: u8 = 3
+const K_NOT_ANY: u8 = 4
+
+type Cond = { kind: u8, col: String, op: String, value: postgres.Value, values: List[postgres.Value] }
+
+const Q_SELECT: u8 = 1
+const Q_INSERT: u8 = 2
+const Q_UPDATE: u8 = 3
+const Q_DELETE: u8 = 4
+
+pub type Builder = {
+    kind: u8,
+    table: String,
+    cols: List[String],
+    conds: List[Cond],
+    orders: List[(String, bool)],
+    has_limit: bool,
+    limit_n: i64,
+    has_offset: bool,
+    offset_n: i64,
+    rows: List[List[postgres.Value]],
+    sets: List[(String, postgres.Value)],
+    returning: List[String],
+    all_rows: bool,
+    has_schema: bool,
+    sch: schema.Schema,
+    error: String
+}
+
+/// The SQL and its parameters.
+pub type Built = { sql: String, params: List[postgres.Value] }
+
+/// The names in `xs` as Strings (a list of literals is a `List[str]`).
+pub fn names(xs: List[str]) -> List[String] {
+    let mut out: List[String] = List.new()
+    for x in xs { out.push(String.from(x)) }
+    out
+}
+
+fn new_builder(kind: u8, table: String, cols: List[String]) -> Builder {
+    Builder(kind, table, cols, List.new(), List.new(), false, 0, false, 0, List.new(), List.new(), List.new(), false, false, schema.empty(), s(""))
+}
+
+/// `SELECT cols FROM table`.
+pub fn select(table: String, cols: List[String]) -> Builder { new_builder(Q_SELECT, table, cols) }
+
+/// `INSERT INTO table (cols) VALUES ...`: add rows with `row`.
+pub fn insert_into(table: String, cols: List[String]) -> Builder { new_builder(Q_INSERT, table, cols) }
+
+/// `UPDATE table SET ...`: add assignments with `set`.
+pub fn update(table: String) -> Builder { new_builder(Q_UPDATE, table, List.new()) }
+
+/// `DELETE FROM table`.
+pub fn delete_from(table: String) -> Builder { new_builder(Q_DELETE, table, List.new()) }
+
+/// Whether `n` is a name the builder writes: letters, digits and `_`, starting with a letter or `_`, up to 63.
+pub fn ident_ok(n: String) -> bool {
+    if n.len() == 0 || n.len() > 63 { return false }
+    for i in 0..n.len() {
+        let b = n.byte(i)
+        let letter = (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || b == 95
+        let digit = b >= 48 && b <= 57
+        if !(letter || (digit && i > 0)) { return false }
+    }
+    true
+}
+
+fn quote(n: String) -> String { client.quote_ident(n) }
+
+impl Builder {
+    fn fail(self, msg: String) -> Builder {
+        let mut b = self.copy()
+        if b.error.len() == 0 { b.error = msg }
+        b
+    }
+
+    fn name(self, n: String, what: str) -> Builder {
+        if ident_ok(n.copy()) { return self.copy() }
+        let mut m = s("not a valid ")
+        m.push_str(what)
+        m.push_str(" name: ")
+        m.append(n)
+        self.fail(m)
+    }
+
+    /// Checks the table and every column against the schema when `build()` runs.
+    fn with_schema(self, sch: schema.Schema) -> Builder {
+        let mut b = self.copy()
+        b.has_schema = true
+        b.sch = sch
+        b
+    }
+
+    fn cond(self, kind: u8, col: String, op: String, value: postgres.Value, values: List[postgres.Value]) -> Builder {
+        let mut b = self.name(col.copy(), "column")
+        b.conds.push(Cond(kind, col, op, value, values))
+        b
+    }
+
+    fn where_eq(self, col: String, v: postgres.Value) -> Builder { self.cond(K_COMPARE, col, s("="), v, List.new()) }
+
+    fn where_cmp(self, col: String, op: Cmp, v: postgres.Value) -> Builder { self.cond(K_COMPARE, col, s(cmp_text(op)), v, List.new()) }
+
+    /// `col = ANY($n)` with the values as one array parameter. An empty list matches nothing.
+    fn where_in(self, col: String, vs: List[postgres.Value]) -> Builder { self.cond(K_ANY, col, s(""), postgres.Null, vs) }
+
+    fn where_not_in(self, col: String, vs: List[postgres.Value]) -> Builder { self.cond(K_NOT_ANY, col, s(""), postgres.Null, vs) }
+
+    fn where_null(self, col: String) -> Builder { self.cond(K_NULL, col, s(""), postgres.Null, List.new()) }
+
+    fn where_not_null(self, col: String) -> Builder { self.cond(K_NOT_NULL, col, s(""), postgres.Null, List.new()) }
+
+    fn order_by(self, col: String, dir: Dir) -> Builder {
+        let mut b = self.name(col.copy(), "column")
+        let desc = match dir {
+            Asc => false
+            Desc => true
+        }
+        b.orders.push((col, desc))
+        b
+    }
+
+    /// `order_by` with the column taken from `allowed`: any other is an error (the request names the column, the
+    /// program lists the possible ones).
+    fn order_by_allowed(self, col: String, dir: Dir, allowed: List[String]) -> Builder {
+        if !allowed.contains(col.copy()) {
+            let mut m = s("cannot sort by ")
+            m.append(col)
+            return self.fail(m)
+        }
+        self.order_by(col, dir)
+    }
+
+    fn limit(self, n: i64) -> Builder {
+        let mut b = self.copy()
+        b.has_limit = true
+        b.limit_n = n
+        b
+    }
+
+    fn offset(self, n: i64) -> Builder {
+        let mut b = self.copy()
+        b.has_offset = true
+        b.offset_n = n
+        b
+    }
+
+    /// One row of an INSERT: a value per column, in order.
+    fn row(self, values: List[postgres.Value]) -> Builder {
+        let mut b = self.copy()
+        b.rows.push(values)
+        b
+    }
+
+    /// `col = value` of an UPDATE.
+    fn set(self, col: String, v: postgres.Value) -> Builder {
+        let mut b = self.name(col.copy(), "column")
+        b.sets.push((col, v))
+        b
+    }
+
+    /// `RETURNING cols`.
+    fn returning(self, cols: List[String]) -> Builder {
+        let mut b = self.copy()
+        for c in cols.copy() { b = b.name(c, "column") }
+        b.returning = cols
+        b
+    }
+
+    /// Allows an UPDATE or DELETE without a condition.
+    fn all_rows(self) -> Builder {
+        let mut b = self.copy()
+        b.all_rows = true
+        b
+    }
+
+    fn build(self) -> Result[Built, sql.Error] { finish(self.copy()) }
+}
+
+fn fail_text(msg: String) -> sql.Error { sql.error(msg, sql.NOPOS) }
+
+fn cols_text(cols: List[String]) -> String {
+    let mut out = s("")
+    let mut first = true
+    for c in cols {
+        if !first { out.push_str(", ") }
+        first = false
+        out.append(quote(c))
+    }
+    out
+}
+
+fn check_schema(b: Builder) -> Option[String] {
+    if !b.has_schema { return None }
+    let ti = match schema.find_table(b.sch.copy(), b.table.copy()) {
+        Some(i) => i
+        None => {
+            let mut m = s("no such table: ")
+            m.append(b.table.copy())
+            return Some(m)
+        }
+    }
+    let t = b.sch.tables[ti].copy()
+    let mut used: List[String] = List.new()
+    for c in b.cols.copy() { used.push(c) }
+    for cd in b.conds.copy() { used.push(cd.col.copy()) }
+    for o in b.orders.copy() {
+        let (c, d) = o
+        used.push(c)
+    }
+    for st in b.sets.copy() {
+        let (c, v) = st
+        used.push(c)
+    }
+    for c in b.returning.copy() { used.push(c) }
+    for c in used {
+        if schema.find_column(t.copy(), c.copy()).is_none() {
+            let mut m = s("no such column in ")
+            m.append(b.table.copy())
+            m.push_str(": ")
+            m.append(c)
+            return Some(m)
+        }
+    }
+    None
+}
+
+fn add_param(inout params: List[postgres.Value], v: postgres.Value) -> String {
+    params.push(v)
+    let mut p = s("$")
+    p.append(String.from_int(params.len() as i64))
+    p
+}
+
+fn where_text(b: Builder, inout params: List[postgres.Value]) -> String {
+    if b.conds.len() == 0 { return s("") }
+    let mut out = s(" WHERE ")
+    let mut first = true
+    for cd in b.conds.copy() {
+        if !first { out.push_str(" AND ") }
+        first = false
+        out.append(quote(cd.col.copy()))
+        if cd.kind == K_COMPARE {
+            out.push_str(" ")
+            out.append(cd.op.copy())
+            out.push_str(" ")
+            out.append(add_param(inout params, cd.value.copy()))
+        } else if cd.kind == K_ANY {
+            out.push_str(" = ANY(")
+            out.append(add_param(inout params, postgres.Array(cd.values.copy())))
+            out.push_str(")")
+        } else if cd.kind == K_NOT_ANY {
+            out.push_str(" <> ALL(")
+            out.append(add_param(inout params, postgres.Array(cd.values.copy())))
+            out.push_str(")")
+        } else if cd.kind == K_NULL {
+            out.push_str(" IS NULL")
+        } else {
+            out.push_str(" IS NOT NULL")
+        }
+    }
+    out
+}
+
+fn returning_text(b: Builder) -> String {
+    if b.returning.len() == 0 { return s("") }
+    let mut out = s(" RETURNING ")
+    out.append(cols_text(b.returning.copy()))
+    out
+}
+
+fn finish(b: Builder) -> Result[Built, sql.Error] {
+    if b.error.len() > 0 { return Err(fail_text(b.error.copy())) }
+    if !ident_ok(b.table.copy()) {
+        let mut m = s("not a valid table name: ")
+        m.append(b.table.copy())
+        return Err(fail_text(m))
+    }
+    for c in b.cols.copy() {
+        if !ident_ok(c.copy()) {
+            let mut m = s("not a valid column name: ")
+            m.append(c)
+            return Err(fail_text(m))
+        }
+    }
+    match check_schema(b.copy()) {
+        Some(m) => { return Err(fail_text(m)) }
+        None => {}
+    }
+    let mut params: List[postgres.Value] = List.new()
+    let mut out = s("")
+    if b.kind == Q_SELECT {
+        if b.cols.len() == 0 { return Err(fail_text(s("SELECT needs at least one column"))) }
+        out.push_str("SELECT ")
+        out.append(cols_text(b.cols.copy()))
+        out.push_str(" FROM ")
+        out.append(quote(b.table.copy()))
+        out.append(where_text(b.copy(), inout params))
+        if b.orders.len() > 0 {
+            out.push_str(" ORDER BY ")
+            let mut first = true
+            for o in b.orders.copy() {
+                let (c, desc) = o
+                if !first { out.push_str(", ") }
+                first = false
+                out.append(quote(c))
+                if desc { out.push_str(" DESC") }
+            }
+        }
+        if b.has_limit {
+            if b.limit_n < 0 { return Err(fail_text(s("LIMIT must not be negative"))) }
+            out.push_str(" LIMIT ")
+            out.append(add_param(inout params, postgres.Int(b.limit_n)))
+        }
+        if b.has_offset {
+            if b.offset_n < 0 { return Err(fail_text(s("OFFSET must not be negative"))) }
+            out.push_str(" OFFSET ")
+            out.append(add_param(inout params, postgres.Int(b.offset_n)))
+        }
+    } else if b.kind == Q_INSERT {
+        if b.cols.len() == 0 { return Err(fail_text(s("INSERT needs at least one column"))) }
+        if b.rows.len() == 0 { return Err(fail_text(s("INSERT needs at least one row"))) }
+        out.push_str("INSERT INTO ")
+        out.append(quote(b.table.copy()))
+        out.push_str(" (")
+        out.append(cols_text(b.cols.copy()))
+        out.push_str(") VALUES ")
+        let mut first = true
+        for r in b.rows.copy() {
+            if r.len() != b.cols.len() { return Err(fail_text(s("an INSERT row must have a value for each column"))) }
+            if !first { out.push_str(", ") }
+            first = false
+            out.push_str("(")
+            let mut f2 = true
+            for v in r {
+                if !f2 { out.push_str(", ") }
+                f2 = false
+                out.append(add_param(inout params, v))
+            }
+            out.push_str(")")
+        }
+        out.append(returning_text(b.copy()))
+    } else if b.kind == Q_UPDATE {
+        if b.sets.len() == 0 { return Err(fail_text(s("UPDATE needs at least one SET"))) }
+        if b.conds.len() == 0 && !b.all_rows { return Err(fail_text(s("UPDATE without a condition; call all_rows() if every row is meant"))) }
+        out.push_str("UPDATE ")
+        out.append(quote(b.table.copy()))
+        out.push_str(" SET ")
+        let mut first = true
+        for st in b.sets.copy() {
+            let (c, v) = st
+            if !first { out.push_str(", ") }
+            first = false
+            out.append(quote(c))
+            out.push_str(" = ")
+            out.append(add_param(inout params, v))
+        }
+        out.append(where_text(b.copy(), inout params))
+        out.append(returning_text(b.copy()))
+    } else {
+        if b.conds.len() == 0 && !b.all_rows { return Err(fail_text(s("DELETE without a condition; call all_rows() if every row is meant"))) }
+        out.push_str("DELETE FROM ")
+        out.append(quote(b.table.copy()))
+        out.append(where_text(b.copy(), inout params))
+        out.append(returning_text(b.copy()))
+    }
+    if params.len() > 65535 { return Err(fail_text(s("more than 65535 parameters: split the statement"))) }
+    Ok(Built(out, params))
+}
+
+/// Runs a built SELECT (or a statement with RETURNING) and reads the rows as `T`s.
+pub fn query[T: serial.Deserialize](inout c: client.Conn, b: Built, dl: time.Deadline) -> Result[List[T], postgres.Error] uses net, io, clock {
+    typed.query[T](inout c, b.sql.copy(), b.params.copy(), dl)
+}
+
+/// Runs a built INSERT, UPDATE or DELETE; the number of rows changed.
+pub fn exec(inout c: client.Conn, b: Built, dl: time.Deadline) -> Result[u64, postgres.Error] uses net, io, clock {
+    c.exec(b.sql.copy(), b.params.copy(), dl)
+}

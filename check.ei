@@ -1,0 +1,1225 @@
+//! sql.check: checks a parsed statement against a schema, with no database, and infers the types.
+//!
+//! `check(schema, stmt)` returns an `Info`: the type of every parameter (from the column it is compared
+//! with or assigned to, a cast, or the function it is passed to) and the name, type and nullability of every
+//! result column. It resolves tables, aliases and columns (with `did you mean` hints), expands `*`, follows
+//! outer joins for nullability, and refuses what it cannot analyze with an `unsupported:` error instead of
+//! guessing. docs/design.md lists the subset; tests/check_test.ei and the corpus in tests/corpus.sql show it.
+
+import sql
+import sql.parse
+import sql.schema
+
+pub const K_SELECT: u8 = 1
+pub const K_INSERT: u8 = 2
+pub const K_UPDATE: u8 = 3
+pub const K_DELETE: u8 = 4
+
+/// A parameter `$index`: its canonical type, whether it is an array, and whether NULL may be passed
+/// (when it is assigned to a nullable column).
+pub type ParamInfo = { index: i32, ty: String, array: bool, nullable: bool, bound: bool }
+
+/// A result column.
+pub type OutCol = { name: String, ty: String, array: bool, nullable: bool }
+
+pub type Info = { kind: u8, params: List[ParamInfo], cols: List[OutCol] }
+
+/// The type of an expression: `ty` is "" while unknown (a NULL, an untyped parameter); `lit` marks a
+/// string literal (which converts to any type); `param` is the parameter number when the expression is
+/// exactly a parameter.
+type Ty = { ty: String, array: bool, nullable: bool, lit: bool, param: i32 }
+
+type Source = { alias: String, table: String, cols: List[schema.Column], nullable: bool }
+
+type Ctx = { sch: schema.Schema, sources: List[Source], params: List[ParamInfo], aliases: List[String] }
+
+fn s(x: str) -> String { String.from(x) }
+
+fn ty(name: str, nullable: bool) -> Ty { Ty(s(name), false, nullable, false, 0) }
+
+fn unknown() -> Ty { Ty(s(""), false, true, false, 0) }
+
+fn is_unknown(t: Ty) -> bool { t.ty.len() == 0 }
+
+const MAX_PARAMS: i32 = 1000
+
+fn err(msg: String, at: usize) -> sql.Error { sql.error(msg, at) }
+
+fn msg3(a: str, b: String, c: str) -> String {
+    let mut m = s(a)
+    m.append(b)
+    m.push_str(c)
+    m
+}
+
+// ---------------------------------------------------------------------------------- parameters
+
+fn ensure_param(inout ctx: Ctx, n: i32, at: usize) -> Result[(), sql.Error] {
+    if n < 1 || n > MAX_PARAMS { return Err(err(msg3("parameter number $", String.from_int(n as i64), " is out of range (1 to 1000)"), at)) }
+    while (ctx.params.len() as i32) < n {
+        let i = ctx.params.len() as i32 + 1
+        ctx.params.push(ParamInfo(i, s(""), false, false, false))
+    }
+    Ok(())
+}
+
+fn numeric_rank(t: String) -> i32 {
+    if t == s("int2") { return 1 }
+    if t == s("int4") { return 2 }
+    if t == s("int8") { return 3 }
+    if t == s("numeric") { return 4 }
+    if t == s("float4") { return 5 }
+    if t == s("float8") { return 6 }
+    0
+}
+
+fn class_of(t: String) -> i32 {
+    if numeric_rank(t.copy()) > 0 || t == s("oid") { return 1 }
+    if t == s("text") { return 2 }
+    if t == s("bool") { return 3 }
+    if t == s("date") || t == s("timestamp") || t == s("timestamptz") { return 4 }
+    if t == s("time") || t == s("timetz") { return 5 }
+    if t == s("interval") { return 6 }
+    if t == s("bytea") { return 7 }
+    if t == s("uuid") { return 8 }
+    if t == s("jsonb") { return 9 }
+    if t == s("json") { return 10 }
+    if t == s("inet") || t == s("cidr") { return 11 }
+    0
+}
+
+/// Whether values of the two types can be compared or assigned (PostgreSQL has an operator or an
+/// implicit conversion for them). Enums only with the same enum (or a literal).
+fn compatible(a: Ty, b: Ty) -> bool {
+    if is_unknown(a.copy()) || is_unknown(b.copy()) { return true }
+    if a.lit || b.lit { return true }
+    if a.array != b.array { return false }
+    if a.ty == b.ty { return true }
+    let ca = class_of(a.ty.copy())
+    let cb = class_of(b.ty.copy())
+    ca != 0 && ca == cb
+}
+
+fn show_ty(t: Ty) -> String {
+    if is_unknown(t.copy()) { return s("unknown") }
+    schema.type_text(t.ty.copy(), t.array)
+}
+
+/// Binds parameter `n` to `t`; a second binding must agree (integers widen).
+fn bind(inout ctx: Ctx, n: i32, t: Ty, nullable: bool, at: usize) -> Result[(), sql.Error] {
+    ensure_param(inout ctx, n, at)?
+    if is_unknown(t.copy()) { return Ok(()) }
+    let i = (n - 1) as usize
+    if ctx.params[i].bound {
+        let cur = Ty(ctx.params[i].ty.copy(), ctx.params[i].array, false, false, 0)
+        if t.lit { return Ok(()) }
+        if cur.ty == t.ty && cur.array == t.array {
+            if nullable { ctx.params[i].nullable = true }
+            return Ok(())
+        }
+        if cur.array == t.array && numeric_rank(cur.ty.copy()) > 0 && numeric_rank(t.ty.copy()) > 0 {
+            if numeric_rank(t.ty.copy()) > numeric_rank(cur.ty.copy()) { ctx.params[i].ty = t.ty.copy() }
+            if nullable { ctx.params[i].nullable = true }
+            return Ok(())
+        }
+        if compatible(cur.copy(), t.copy()) {
+            if nullable { ctx.params[i].nullable = true }
+            return Ok(())
+        }
+        let mut m = s("parameter $")
+        m.append(String.from_int(n as i64))
+        m.push_str(" is used as ")
+        m.append(show_ty(cur))
+        m.push_str(" and as ")
+        m.append(show_ty(t))
+        return Err(err(m, at))
+    }
+    if t.lit {
+        // a string literal gives a parameter no type
+        return Ok(())
+    }
+    ctx.params[i].ty = t.ty.copy()
+    ctx.params[i].array = t.array
+    ctx.params[i].nullable = nullable
+    ctx.params[i].bound = true
+    Ok(())
+}
+
+/// If `e` (inferred as `t`) is a bare parameter without a type, gives it `to`.
+fn bind_if_param(inout ctx: Ctx, t: Ty, to: Ty, nullable: bool, at: usize) -> Result[Ty, sql.Error] {
+    if t.param > 0 && !is_unknown(to.copy()) && !to.lit {
+        bind(inout ctx, t.param, to.copy(), nullable, at)?
+        let mut r = to.copy()
+        r.param = t.param
+        r.nullable = false
+        r.lit = false
+        return Ok(r)
+    }
+    Ok(t)
+}
+
+// ---------------------------------------------------------------------------------- scopes
+
+fn source_of_table(sch: schema.Schema, table: String, alias: String, nullable: bool, at: usize) -> Result[Source, sql.Error] {
+    match schema.find_table(sch.copy(), table.copy()) {
+        Some(i) => Ok(Source(alias, table, sch.tables[i].columns.copy(), nullable))
+        None => {
+            let mut m = msg3("relation \"", table.copy(), "\" does not exist")
+            m.append(similar_hint(table, table_names(sch.copy())))
+            for n in sch.notes {
+                m.push_str("\n  note: ")
+                m.append(n.copy())
+            }
+            Err(err(m, at))
+        }
+    }
+}
+
+fn table_names(sch: schema.Schema) -> List[String] {
+    let mut out: List[String] = List.new()
+    for t in sch.tables { out.push(t.name.copy()) }
+    out
+}
+
+/// Levenshtein distance, capped.
+fn distance(a: String, b: String) -> usize {
+    if a.len() > 40 || b.len() > 40 { return 100 }
+    let mut prev: List[usize] = List.new()
+    for j in 0..(b.len() + 1) { prev.push(j) }
+    for i in 1..(a.len() + 1) {
+        let mut cur: List[usize] = List.new()
+        cur.push(i)
+        for j in 1..(b.len() + 1) {
+            let cost: usize = if a.byte(i - 1) == b.byte(j - 1) { 0 } else { 1 }
+            let mut best = prev[j - 1] + cost
+            if prev[j] + 1 < best { best = prev[j] + 1 }
+            if cur[j - 1] + 1 < best { best = cur[j - 1] + 1 }
+            cur.push(best)
+        }
+        prev = cur
+    }
+    prev[b.len()]
+}
+
+fn similar_hint(name: String, candidates: List[String]) -> String {
+    let mut best = s("")
+    let mut best_d: usize = 3
+    for cnd in candidates {
+        let d = distance(name.copy(), cnd.copy())
+        if d < best_d {
+            best_d = d
+            best = cnd
+        }
+    }
+    if best.len() == 0 { return s("") }
+    msg3("; did you mean \"", best, "\"?")
+}
+
+fn nullable_col(c: schema.Column, src_nullable: bool) -> bool { src_nullable || !(c.not_null || c.pk) }
+
+fn col_ty(c: schema.Column, src_nullable: bool, at: usize, sch: schema.Schema) -> Result[Ty, sql.Error] {
+    if !schema.is_builtin(c.ty.copy()) && schema.find_enum(sch, c.ty.copy()).is_none() {
+        let mut m = s("column \"")
+        m.append(c.name.copy())
+        m.push_str("\" has the type ")
+        m.append(c.ty.copy())
+        m.push_str(", which the checker does not model")
+        return Err(sql.unsupported(m, at))
+    }
+    Ok(Ty(c.ty.copy(), c.array, nullable_col(c.copy(), src_nullable), false, 0))
+}
+
+fn lookup(ctx: Ctx, qual: String, name: String, at: usize) -> Result[Ty, sql.Error] {
+    let mut found: Option[Ty] = None
+    let mut count = 0
+    let mut si: usize = 0
+    let mut qual_seen = false
+    while si < ctx.sources.len() {
+        let src = ctx.sources[si].copy()
+        if qual.len() == 0 || src.alias == qual {
+            if qual.len() > 0 { qual_seen = true }
+            for c in src.cols {
+                if c.name == name {
+                    count += 1
+                    found = Some(col_ty(c.copy(), src.nullable, at, ctx.sch.copy())?)
+                }
+            }
+        }
+        si += 1
+    }
+    if qual.len() > 0 && !qual_seen {
+        let mut m = msg3("missing FROM-clause entry for table \"", qual, "\"")
+        let mut names: List[String] = List.new()
+        for src in ctx.sources { names.push(src.alias.copy()) }
+        m.append(similar_hint(qual.copy(), names))
+        return Err(err(m, at))
+    }
+    if count > 1 { return Err(err(msg3("column reference \"", name, "\" is ambiguous"), at)) }
+    match found {
+        Some(t) => Ok(t)
+        None => {
+            let mut m = s("column \"")
+            if qual.len() > 0 {
+                m.append(qual.copy())
+                m.push_str(".")
+            }
+            m.append(name.copy())
+            m.push_str("\" does not exist")
+            let mut cands: List[String] = List.new()
+            for src in ctx.sources {
+                if qual.len() == 0 || src.alias == qual {
+                    for c in src.cols { cands.push(c.name.copy()) }
+                }
+            }
+            m.append(similar_hint(name, cands))
+            Err(err(m, at))
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------- types of operators
+
+fn promote(a: String, b: String) -> String {
+    if a == s("float8") || b == s("float8") { return s("float8") }
+    if a == s("float4") || b == s("float4") {
+        if a == b { return s("float4") }
+        return s("float8")
+    }
+    if a == s("numeric") || b == s("numeric") { return s("numeric") }
+    if numeric_rank(a.copy()) >= numeric_rank(b.copy()) { return a }
+    b
+}
+
+fn is_temporal3(t: String) -> bool { t == s("date") || t == s("timestamp") || t == s("timestamptz") }
+
+fn no_operator(op: String, a: Ty, b: Ty, at: usize) -> sql.Error {
+    let mut m = s("operator does not exist: ")
+    m.append(show_ty(a))
+    m.push_str(" ")
+    m.append(op)
+    m.push_str(" ")
+    m.append(show_ty(b))
+    err(m, at)
+}
+
+fn arith(op: String, a: Ty, b: Ty, at: usize) -> Result[Ty, sql.Error] {
+    let nl = a.nullable || b.nullable
+    if a.ty == s("") || b.ty == s("") {
+        let known = if a.ty == s("") { b.copy() } else { a.copy() }
+        if known.ty == s("") { return Ok(Ty(s(""), true, true, false, 0)) }
+        return Ok(Ty(known.ty.copy(), known.array, nl, false, 0))
+    }
+    if a.array || b.array { return Err(no_operator(op, a, b, at)) }
+    if numeric_rank(a.ty.copy()) > 0 && numeric_rank(b.ty.copy()) > 0 {
+        if op == s("^") {
+            if a.ty == s("numeric") && b.ty == s("numeric") { return Ok(ty("numeric", nl)) }
+            return Ok(ty("float8", nl))
+        }
+        if op == s("%") && (a.ty == s("float4") || a.ty == s("float8") || b.ty == s("float4") || b.ty == s("float8")) { return Err(no_operator(op, a, b, at)) }
+        return Ok(ty_s(promote(a.ty.copy(), b.ty.copy()), nl))
+    }
+    let plus = op == s("+")
+    let minus = op == s("-")
+    if (plus || minus) {
+        if a.ty == s("date") && b.ty == s("int4") { return Ok(ty("date", nl)) }
+        if plus && a.ty == s("int4") && b.ty == s("date") { return Ok(ty("date", nl)) }
+        if minus && a.ty == s("date") && b.ty == s("date") { return Ok(ty("int4", nl)) }
+        if minus && is_temporal3(a.ty.copy()) && a.ty == b.ty { return Ok(ty("interval", nl)) }
+        if is_temporal3(a.ty.copy()) && b.ty == s("interval") { return Ok(ty_s(if a.ty == s("date") { s("timestamp") } else { a.ty.copy() }, nl)) }
+        if plus && a.ty == s("interval") && is_temporal3(b.ty.copy()) { return Ok(ty_s(if b.ty == s("date") { s("timestamp") } else { b.ty.copy() }, nl)) }
+        if (a.ty == s("time") || a.ty == s("timetz")) && b.ty == s("interval") { return Ok(ty_s(a.ty.copy(), nl)) }
+        if a.ty == s("interval") && b.ty == s("interval") { return Ok(ty("interval", nl)) }
+        if a.lit && (is_temporal3(b.ty.copy()) || b.ty == s("interval")) { return Ok(ty_s(b.ty.copy(), nl)) }
+        if b.lit && (is_temporal3(a.ty.copy()) || a.ty == s("interval")) { return Ok(ty_s(a.ty.copy(), nl)) }
+    }
+    if (op == s("*") || op == s("/")) && a.ty == s("interval") && numeric_rank(b.ty.copy()) > 0 { return Ok(ty("interval", nl)) }
+    if op == s("*") && b.ty == s("interval") && numeric_rank(a.ty.copy()) > 0 { return Ok(ty("interval", nl)) }
+    Err(no_operator(op, a, b, at))
+}
+
+fn ty_s(name: String, nullable: bool) -> Ty { Ty(name, false, nullable, false, 0) }
+
+/// The common type of the branches of a CASE, COALESCE, GREATEST or an array: the first known type,
+/// numbers promoted; a literal gives way to any other type.
+fn unify(a: Ty, b: Ty, at: usize) -> Result[Ty, sql.Error] {
+    if is_unknown(a.copy()) { return Ok(b) }
+    if is_unknown(b.copy()) { return Ok(a) }
+    if a.lit && !b.lit { return Ok(b) }
+    if b.lit && !a.lit { return Ok(a) }
+    if a.array != b.array {
+        let mut m = s("types ")
+        m.append(show_ty(a))
+        m.push_str(" and ")
+        m.append(show_ty(b))
+        m.push_str(" cannot be matched")
+        return Err(err(m, at))
+    }
+    if a.ty == b.ty { return Ok(a) }
+    if numeric_rank(a.ty.copy()) > 0 && numeric_rank(b.ty.copy()) > 0 { return Ok(Ty(promote(a.ty.copy(), b.ty.copy()), false, a.nullable || b.nullable, false, 0)) }
+    if class_of(a.ty.copy()) != 0 && class_of(a.ty.copy()) == class_of(b.ty.copy()) {
+        // timestamp and timestamptz, date and timestamp: the later one in this list wins
+        if a.ty == s("timestamptz") || b.ty == s("timestamptz") { return Ok(ty("timestamptz", a.nullable || b.nullable)) }
+        if a.ty == s("timestamp") || b.ty == s("timestamp") { return Ok(ty("timestamp", a.nullable || b.nullable)) }
+        return Ok(a)
+    }
+    let mut m = s("types ")
+    m.append(show_ty(a))
+    m.push_str(" and ")
+    m.append(show_ty(b))
+    m.push_str(" cannot be matched")
+    Err(err(m, at))
+}
+
+// ---------------------------------------------------------------------------------- expressions
+
+fn int_literal_type(digits: String) -> String {
+    if digits.len() <= 9 { return s("int4") }
+    if digits.len() <= 18 { return s("int8") }
+    if digits.len() == 19 && digits <= s("9223372036854775807") { return s("int8") }
+    s("numeric")
+}
+
+fn infer(inout ctx: Ctx, n: parse.Node) -> Result[Ty, sql.Error] {
+    let k = n.kind
+    if k == parse.N_COL { return lookup(ctx.copy(), n.qual.copy(), n.name.copy(), n.pos) }
+    if k == parse.N_INT { return Ok(ty_s(int_literal_type(n.name.copy()), false)) }
+    if k == parse.N_NUM { return Ok(ty("numeric", false)) }
+    if k == parse.N_STR { return Ok(Ty(s("text"), false, false, true, 0)) }
+    if k == parse.N_BOOL { return Ok(ty("bool", false)) }
+    if k == parse.N_NULL { return Ok(unknown()) }
+    if k == parse.N_PARAM {
+        let num = match strings_parse(n.name.copy()) {
+            Some(v) => v
+            None => { return Err(err(s("bad parameter number"), n.pos)) }
+        }
+        ensure_param(inout ctx, num, n.pos)?
+        let p = ctx.params[(num - 1) as usize].copy()
+        if p.bound { return Ok(Ty(p.ty.copy(), p.array, false, false, num)) }
+        return Ok(Ty(s(""), false, false, false, num))
+    }
+    if k == parse.N_STAR { return Err(err(s("`*` is only allowed in a select list and in count(*)"), n.pos)) }
+    if k == parse.N_DEFAULT { return Err(err(s("DEFAULT is only allowed as a value of INSERT or UPDATE"), n.pos)) }
+    if k == parse.N_CAST {
+        let inner = infer(inout ctx, n.kids[0].copy())?
+        let arr = n.qual == s("[]")
+        if !schema.is_builtin(n.name.copy()) && schema.find_enum(ctx.sch.copy(), n.name.copy()).is_none() {
+            return Err(err(msg3("type \"", n.name.copy(), "\" does not exist or is not modeled by the checker"), n.pos))
+        }
+        let target = Ty(n.name.copy(), arr, inner.nullable, false, 0)
+        if inner.param > 0 {
+            bind(inout ctx, inner.param, target.copy(), false, n.pos)?
+            return Ok(Ty(n.name.copy(), arr, false, false, 0))
+        }
+        if !inner.lit && !is_unknown(inner.copy()) && !castable(inner.copy(), target.copy()) {
+            let mut m = s("cannot cast type ")
+            m.append(show_ty(inner))
+            m.push_str(" to ")
+            m.append(show_ty(target))
+            return Err(err(m, n.pos))
+        }
+        return Ok(target)
+    }
+    if k == parse.N_UN {
+        let a = infer(inout ctx, n.kids[0].copy())?
+        if n.name == s("not") {
+            bind_if_param(inout ctx, a.copy(), ty("bool", false), false, n.pos)?
+            return Ok(ty("bool", a.nullable))
+        }
+        if a.param > 0 && is_unknown(a.copy()) {
+            return Err(err(s("cannot infer the type of the parameter under a unary operator; add a cast"), n.pos))
+        }
+        if is_unknown(a.copy()) { return Ok(a) }
+        if numeric_rank(a.ty.copy()) == 0 && a.ty != s("interval") { return Err(no_operator(n.name.copy(), ty("", false), a, n.pos)) }
+        return Ok(Ty(a.ty.copy(), false, a.nullable, false, 0))
+    }
+    if k == parse.N_BIN { return infer_bin(inout ctx, n) }
+    if k == parse.N_IS {
+        let a = infer(inout ctx, n.kids[0].copy())?
+        if n.kids.len() > 1 {
+            let b = infer(inout ctx, n.kids[1].copy())?
+            let ta = bind_if_param(inout ctx, a.copy(), b.copy(), false, n.pos)?
+            let tb = bind_if_param(inout ctx, b.copy(), a.copy(), false, n.pos)?
+            if !compatible(ta.copy(), tb.copy()) { return Err(no_operator(s("IS DISTINCT FROM"), ta, tb, n.pos)) }
+        } else if n.name == s("true") || n.name == s("false") || n.name == s("not true") || n.name == s("not false") || n.name == s("unknown") || n.name == s("not unknown") {
+            bind_if_param(inout ctx, a.copy(), ty("bool", false), false, n.pos)?
+        }
+        return Ok(ty("bool", false))
+    }
+    if k == parse.N_IN {
+        let a = infer(inout ctx, n.kids[0].copy())?
+        let mut nl = a.nullable.copy()
+        let mut i: usize = 1
+        let mut lhs = a.copy()
+        // a parameter on the left takes the type of the first typed item
+        while i < n.kids.len() {
+            let b = infer(inout ctx, n.kids[i].copy())?
+            if lhs.param > 0 && is_unknown(lhs.copy()) && !is_unknown(b.copy()) {
+                lhs = bind_if_param(inout ctx, lhs.copy(), b.copy(), false, n.pos)?
+            }
+            let tb = bind_if_param(inout ctx, b.copy(), lhs.copy(), false, n.pos)?
+            if !compatible(lhs.copy(), tb.copy()) { return Err(no_operator(s("="), lhs.copy(), tb, n.pos)) }
+            if b.nullable { nl = true }
+            i += 1
+        }
+        return Ok(ty("bool", nl))
+    }
+    if k == parse.N_BETWEEN {
+        let a = infer(inout ctx, n.kids[0].copy())?
+        let lo = infer(inout ctx, n.kids[1].copy())?
+        let hi = infer(inout ctx, n.kids[2].copy())?
+        let mut lhs = a.copy()
+        if lhs.param > 0 && is_unknown(lhs.copy()) {
+            let from = if !is_unknown(lo.copy()) { lo.copy() } else { hi.copy() }
+            lhs = bind_if_param(inout ctx, lhs.copy(), from, false, n.pos)?
+        }
+        let tl = bind_if_param(inout ctx, lo.copy(), lhs.copy(), false, n.pos)?
+        let th = bind_if_param(inout ctx, hi.copy(), lhs.copy(), false, n.pos)?
+        if !compatible(lhs.copy(), tl) || !compatible(lhs.copy(), th) { return Err(no_operator(s("BETWEEN"), lhs, lo, n.pos)) }
+        return Ok(ty("bool", a.nullable || lo.nullable || hi.nullable))
+    }
+    if k == parse.N_ARRAY {
+        let mut elem = unknown()
+        let mut ps: List[Ty] = List.new()
+        for e in n.kids {
+            let t = infer(inout ctx, e.copy())?
+            ps.push(t.copy())
+            if t.param == 0 { elem = unify(elem, t, n.pos)? }
+        }
+        if is_unknown(elem.copy()) { return Err(err(s("cannot determine the type of the array; add a cast (ARRAY[]::int4[])"), n.pos)) }
+        if elem.lit { elem = ty("text", false) }
+        for t in ps { bind_if_param(inout ctx, t, elem.copy(), false, n.pos)? }
+        return Ok(Ty(elem.ty.copy(), true, false, false, 0))
+    }
+    if k == parse.N_INDEX {
+        let a = infer(inout ctx, n.kids[0].copy())?
+        let i = infer(inout ctx, n.kids[1].copy())?
+        bind_if_param(inout ctx, i, ty("int4", false), false, n.pos)?
+        if !a.array { return Err(err(s("cannot subscript a value that is not an array"), n.pos)) }
+        return Ok(Ty(a.ty.copy(), false, true, false, 0))
+    }
+    if k == parse.N_CASE { return infer_case(inout ctx, n) }
+    if k == parse.N_FUNC { return infer_func(inout ctx, n) }
+    Err(err(s("internal: unknown expression kind"), n.pos))
+}
+
+fn strings_parse(t: String) -> Option[i32] {
+    if t.len() == 0 || t.len() > 9 { return None }
+    let mut v: i32 = 0
+    for i in 0..t.len() {
+        let b = t.byte(i)
+        if b < 48 || b > 57 { return None }
+        v = v * 10 + ((b - 48) as i32)
+    }
+    Some(v)
+}
+
+fn castable(from: Ty, to: Ty) -> bool {
+    if from.array != to.array { return false }
+    if from.ty == to.ty { return true }
+    // anything converts to and from text by an explicit cast
+    if to.ty == s("text") || from.ty == s("text") { return true }
+    let a = class_of(from.ty.copy())
+    let b = class_of(to.ty.copy())
+    if a == 0 || b == 0 { return false }
+    if a == b { return true }
+    // date/time types, json to jsonb, bool and numbers
+    if (a == 4 && b == 5) || (a == 5 && b == 4) { return true }
+    if (a == 9 && b == 10) || (a == 10 && b == 9) { return true }
+    if (a == 1 && b == 3) || (a == 3 && b == 1) { return from.ty == s("int4") || to.ty == s("int4") }
+    false
+}
+
+fn infer_bin(inout ctx: Ctx, n: parse.Node) -> Result[Ty, sql.Error] {
+    let op = n.name.copy()
+    let a = infer(inout ctx, n.kids[0].copy())?
+    let b = infer(inout ctx, n.kids[1].copy())?
+    if op == s("and") || op == s("or") {
+        bind_if_param(inout ctx, a.copy(), ty("bool", false), false, n.pos)?
+        bind_if_param(inout ctx, b.copy(), ty("bool", false), false, n.pos)?
+        return Ok(ty("bool", a.nullable || b.nullable))
+    }
+    if strings_ends(op.copy(), " any") || strings_ends(op.copy(), " all") {
+        // x = ANY($1): the right side is an array of the left's type
+        let mut l = a.copy()
+        let mut r = b.copy()
+        if r.param > 0 && is_unknown(r.copy()) && !is_unknown(l.copy()) {
+            bind(inout ctx, r.param, Ty(l.ty.copy(), true, false, false, 0), false, n.pos)?
+            r = Ty(l.ty.copy(), true, false, false, r.param)
+        } else if l.param > 0 && is_unknown(l.copy()) && !is_unknown(r.copy()) {
+            bind(inout ctx, l.param, Ty(r.ty.copy(), false, false, false, 0), false, n.pos)?
+            l = Ty(r.ty.copy(), false, false, false, l.param)
+        }
+        if is_unknown(l.copy()) || is_unknown(r.copy()) { return Err(err(s("cannot infer the types around ANY; add a cast"), n.pos)) }
+        if !r.array { return Err(err(s("ANY/ALL needs an array on the right"), n.pos)) }
+        if !compatible(Ty(l.ty.copy(), false, false, l.lit, 0), Ty(r.ty.copy(), false, false, false, 0)) { return Err(no_operator(op, l, r, n.pos)) }
+        return Ok(ty("bool", a.nullable || b.nullable))
+    }
+    if op == s("=") || op == s("<>") || op == s("!=") || op == s("<") || op == s(">") || op == s("<=") || op == s(">=") {
+        let ta = bind_if_param(inout ctx, a.copy(), b.copy(), false, n.pos)?
+        let tb = bind_if_param(inout ctx, b.copy(), ta.copy(), false, n.pos)?
+        if (ta.param > 0 && is_unknown(ta.copy())) || (tb.param > 0 && is_unknown(tb.copy())) {
+            if !(is_unknown(ta.copy()) && is_unknown(tb.copy()) && ta.param == 0 && tb.param == 0) {
+                return Err(err(s("cannot infer the type of a parameter compared with another untyped value; add a cast"), n.pos))
+            }
+        }
+        if !compatible(ta.copy(), tb.copy()) { return Err(no_operator(op, ta, tb, n.pos)) }
+        if (ta.ty == s("json") || tb.ty == s("json")) && !ta.lit && !tb.lit { return Err(no_operator(op, ta, tb, n.pos)) }
+        return Ok(ty("bool", a.nullable || b.nullable))
+    }
+    if op == s("like") || op == s("ilike") || op == s("not like") || op == s("not ilike") || op == s("similar to") || op == s("not similar to") || op == s("~") || op == s("~*") || op == s("!~") || op == s("!~*") {
+        bind_if_param(inout ctx, a.copy(), ty("text", false), false, n.pos)?
+        bind_if_param(inout ctx, b.copy(), ty("text", false), false, n.pos)?
+        if (!is_unknown(a.copy()) && a.ty != s("text") && !a.lit) || a.array {
+            return Err(no_operator(op, a, b, n.pos))
+        }
+        return Ok(ty("bool", a.nullable || b.nullable))
+    }
+    if op == s("+") || op == s("-") || op == s("*") || op == s("/") || op == s("%") || op == s("^") {
+        let ta = bind_if_param(inout ctx, a.copy(), b.copy(), false, n.pos)?
+        let tb = bind_if_param(inout ctx, b.copy(), ta.copy(), false, n.pos)?
+        if is_unknown(ta.copy()) && is_unknown(tb.copy()) && (ta.param > 0 || tb.param > 0) {
+            return Err(err(s("cannot infer the type of a parameter in arithmetic with another untyped value; add a cast"), n.pos))
+        }
+        return arith(op, ta, tb, n.pos)
+    }
+    if op == s("||") {
+        // a parameter next to text (or a literal) is text
+        let a_text = (a.ty == s("text") && !a.array) || a.lit
+        let b_text = (b.ty == s("text") && !b.array) || b.lit
+        if a.param > 0 && is_unknown(a.copy()) && b_text { bind(inout ctx, a.param, ty("text", false), false, n.pos)? }
+        if b.param > 0 && is_unknown(b.copy()) && a_text { bind(inout ctx, b.param, ty("text", false), false, n.pos)? }
+        let a2 = infer(inout ctx, n.kids[0].copy())?
+        let b2 = infer(inout ctx, n.kids[1].copy())?
+        let ta = bind_if_param(inout ctx, a2.copy(), b2.copy(), false, n.pos)?
+        let tb = bind_if_param(inout ctx, b2.copy(), ta.copy(), false, n.pos)?
+        let nl = ta.nullable || tb.nullable
+        if ta.array && tb.array { return Ok(Ty(ta.ty.copy(), true, nl, false, 0)) }
+        if ta.array && !tb.array { return Ok(Ty(ta.ty.copy(), true, nl, false, 0)) }
+        if tb.array && !ta.array { return Ok(Ty(tb.ty.copy(), true, nl, false, 0)) }
+        if ta.ty == s("jsonb") && tb.ty == s("jsonb") { return Ok(ty("jsonb", nl)) }
+        if ta.ty == s("text") || tb.ty == s("text") || ta.lit || tb.lit { return Ok(ty("text", nl)) }
+        if is_unknown(ta.copy()) || is_unknown(tb.copy()) { return Ok(ty("text", nl)) }
+        // anynonarray || text: PostgreSQL converts the other side to text
+        if ta.ty == s("bytea") && tb.ty == s("bytea") { return Ok(ty("bytea", nl)) }
+        return Err(no_operator(op, ta, tb, n.pos))
+    }
+    if op == s("->") || op == s("->>") || op == s("#>") || op == s("#>>") {
+        if !(a.ty == s("json") || a.ty == s("jsonb")) {
+            if a.param > 0 { return Err(err(s("cannot infer a json parameter; add a cast ($1::jsonb)"), n.pos)) }
+            return Err(no_operator(op, a, b, n.pos))
+        }
+        if op == s("->>") || op == s("#>>") {
+            bind_if_param(inout ctx, b.copy(), ty("text", false), false, n.pos)?
+            return Ok(ty("text", true))
+        }
+        if op == s("#>") {
+            bind_if_param(inout ctx, b.copy(), Ty(s("text"), true, false, false, 0), false, n.pos)?
+        } else {
+            bind_if_param(inout ctx, b.copy(), ty("text", false), false, n.pos)?
+        }
+        return Ok(ty_s(a.ty.copy(), true))
+    }
+    if op == s("?") || op == s("?|") || op == s("?&") {
+        bind_if_param(inout ctx, b.copy(), if op == s("?") { ty("text", false) } else { Ty(s("text"), true, false, false, 0) }, false, n.pos)?
+        return Ok(ty("bool", a.nullable))
+    }
+    if op == s("@>") || op == s("<@") || op == s("&&") || op == s("?") || op == s("?|") || op == s("?&") || op == s("@@") {
+        let ta = bind_if_param(inout ctx, a.copy(), b.copy(), false, n.pos)?
+        let tb = bind_if_param(inout ctx, b.copy(), ta.copy(), false, n.pos)?
+        if is_unknown(ta.copy()) || is_unknown(tb.copy()) {
+            if !(ta.lit || tb.lit) { return Err(err(s("cannot infer the types around this operator; add a cast"), n.pos)) }
+        }
+        return Ok(ty("bool", ta.nullable || tb.nullable))
+    }
+    if op == s("at time zone") {
+        bind_if_param(inout ctx, b.copy(), ty("text", false), false, n.pos)?
+        if a.ty == s("timestamp") { return Ok(ty("timestamptz", a.nullable || b.nullable)) }
+        if a.ty == s("timestamptz") { return Ok(ty("timestamp", a.nullable || b.nullable)) }
+        return Err(no_operator(op, a, b, n.pos))
+    }
+    Err(sql.unsupported(msg3("the operator `", op, "`"), n.pos))
+}
+
+fn strings_ends(t: String, suffix: str) -> bool {
+    let sf = s(suffix)
+    if sf.len() > t.len() { return false }
+    t.slice(t.len() - sf.len(), t.len()) == sf
+}
+
+fn infer_case(inout ctx: Ctx, n: parse.Node) -> Result[Ty, sql.Error] {
+    let has_else = n.name == s("else")
+    let mut results: List[Ty] = List.new()
+    let mut i: usize = 0
+    let pairs = if has_else { (n.kids.len() - 1) / 2 } else { n.kids.len() / 2 }
+    while i < pairs {
+        let w = infer(inout ctx, n.kids[2 * i].copy())?
+        bind_if_param(inout ctx, w, ty("bool", false), false, n.pos)?
+        results.push(infer(inout ctx, n.kids[2 * i + 1].copy())?)
+        i += 1
+    }
+    if has_else { results.push(infer(inout ctx, n.kids[n.kids.len() - 1].copy())?) }
+    let mut u = unknown()
+    let mut nl = !has_else
+    for r in results {
+        if r.nullable { nl = true }
+        if r.param == 0 { u = unify(u, r.copy(), n.pos)? }
+    }
+    if u.lit || is_unknown(u.copy()) { u = ty("text", false) }
+    for r in results { bind_if_param(inout ctx, r, u.copy(), false, n.pos)? }
+    Ok(Ty(u.ty.copy(), u.array, nl, false, 0))
+}
+
+// ---------------------------------------------------------------------------------- functions
+
+/// (name, argument types, result, nullability). Argument types: a type name, `T` (the common type of
+/// the polymorphic arguments), `any`, `arr`; a trailing `?` is optional and `...` repeats the last.
+/// Result: a type name, `T`, `arrT`, `elem`, `sum`, `avg`. Nullability: `strict` (NULL in, NULL out),
+/// `never`, `always`, `coalesce` (null only when every argument is).
+fn functions() -> List[(String, String, String, String)] {
+    let raw = List[
+        ("count", "any", "int8", "never"),
+        ("sum", "T", "sum", "always"), ("avg", "T", "avg", "always"), ("min", "T", "T", "always"), ("max", "T", "T", "always"),
+        ("bool_and", "bool", "bool", "always"), ("bool_or", "bool", "bool", "always"), ("every", "bool", "bool", "always"),
+        ("array_agg", "T", "arrT", "always"), ("string_agg", "text text", "text", "always"),
+        ("json_agg", "any", "json", "always"), ("jsonb_agg", "any", "jsonb", "always"),
+        ("coalesce", "T ...", "T", "coalesce"), ("nullif", "T T", "T", "always"),
+        ("greatest", "T ...", "T", "coalesce"), ("least", "T ...", "T", "coalesce"),
+        ("lower", "text", "text", "strict"), ("upper", "text", "text", "strict"), ("initcap", "text", "text", "strict"),
+        ("trim", "text text?", "text", "strict"), ("ltrim", "text text?", "text", "strict"), ("rtrim", "text text?", "text", "strict"), ("btrim", "text text?", "text", "strict"),
+        ("reverse", "text", "text", "strict"), ("md5", "text", "text", "strict"), ("quote_ident", "text", "text", "strict"), ("quote_literal", "text", "text", "strict"),
+        ("repeat", "text int4", "text", "strict"), ("left", "text int4", "text", "strict"), ("right", "text int4", "text", "strict"),
+        ("lpad", "text int4 text?", "text", "strict"), ("rpad", "text int4 text?", "text", "strict"),
+        ("substr", "text int4 int4?", "text", "strict"), ("substring", "text int4 int4?", "text", "strict"),
+        ("replace", "text text text", "text", "strict"), ("translate", "text text text", "text", "strict"), ("split_part", "text text int4", "text", "strict"),
+        ("regexp_replace", "text text text text?", "text", "strict"), ("concat", "any ...", "text", "never"),
+        ("concat_ws", "text any ...", "text", "never"), ("format", "text any ...", "text", "never"),
+        ("chr", "int4", "text", "strict"), ("ascii", "text", "int4", "strict"), ("to_char", "any text", "text", "strict"),
+        ("length", "text", "int4", "strict"), ("char_length", "text", "int4", "strict"), ("character_length", "text", "int4", "strict"), ("octet_length", "text", "int4", "strict"),
+        ("strpos", "text text", "int4", "strict"), ("position", "text text", "int4", "strict"),
+        ("abs", "T", "T", "strict"), ("ceil", "T", "T", "strict"), ("ceiling", "T", "T", "strict"), ("floor", "T", "T", "strict"), ("sign", "T", "T", "strict"),
+        ("round", "T int4?", "T", "strict"), ("trunc", "T int4?", "T", "strict"), ("mod", "T T", "T", "strict"),
+        ("sqrt", "float8", "float8", "strict"), ("power", "float8 float8", "float8", "strict"), ("exp", "float8", "float8", "strict"), ("ln", "float8", "float8", "strict"),
+        ("now", "", "timestamptz", "never"), ("clock_timestamp", "", "timestamptz", "never"), ("statement_timestamp", "", "timestamptz", "never"), ("transaction_timestamp", "", "timestamptz", "never"),
+        ("current_timestamp", "", "timestamptz", "never"), ("current_date", "", "date", "never"), ("current_time", "", "timetz", "never"),
+        ("localtimestamp", "", "timestamp", "never"), ("localtime", "", "time", "never"),
+        ("current_user", "", "text", "never"), ("session_user", "", "text", "never"), ("current_schema", "", "text", "never"), ("current_catalog", "", "text", "never"),
+        ("date_trunc", "text T", "T", "strict"), ("date_part", "text any", "float8", "strict"), ("extract", "any", "numeric", "strict"),
+        ("age", "any any?", "interval", "strict"), ("make_date", "int4 int4 int4", "date", "strict"),
+        ("gen_random_uuid", "", "uuid", "never"), ("uuid_generate_v4", "", "uuid", "never"), ("random", "", "float8", "never"),
+        ("jsonb_build_object", "any ...", "jsonb", "never"), ("json_build_object", "any ...", "json", "never"), ("jsonb_build_array", "any ...", "jsonb", "never"),
+        ("to_jsonb", "any", "jsonb", "strict"), ("to_json", "any", "json", "strict"), ("jsonb_typeof", "jsonb", "text", "strict"), ("jsonb_array_length", "jsonb", "int4", "strict"),
+        ("array_length", "arr int4", "int4", "always"), ("cardinality", "arr", "int4", "strict"),
+        ("array_to_string", "arr text text?", "text", "strict"), ("string_to_array", "text text", "textarr", "strict"),
+        ("array_append", "arr T", "arrT", "strict"), ("array_prepend", "T arr", "arrT", "strict"), ("array_remove", "arr T", "arrT", "strict"), ("array_cat", "arr arr", "arrT", "strict")
+    ]
+    let mut out: List[(String, String, String, String)] = List.new()
+    for r in raw {
+        let (a, b, c, d) = r
+        out.push((s(a), s(b), s(c), s(d)))
+    }
+    out
+}
+
+fn is_aggregate(name: String) -> bool {
+    name == s("count") || name == s("sum") || name == s("avg") || name == s("min") || name == s("max") || name == s("array_agg") || name == s("string_agg") || name == s("bool_and") || name == s("bool_or") || name == s("every") || name == s("json_agg") || name == s("jsonb_agg")
+}
+
+fn spec_args(spec: String) -> List[String] {
+    let mut out: List[String] = List.new()
+    let mut cur = s("")
+    for i in 0..spec.len() {
+        let b = spec.byte(i)
+        if b == 32 {
+            if cur.len() > 0 { out.push(cur) }
+            cur = s("")
+        } else {
+            cur.push_byte(b)
+        }
+    }
+    if cur.len() > 0 { out.push(cur) }
+    out
+}
+
+fn infer_func(inout ctx: Ctx, n: parse.Node) -> Result[Ty, sql.Error] {
+    let name = n.name.copy()
+    let mut found: Option[(String, String, String, String)] = None
+    for f in functions() {
+        let (fname, fargs, fret, fnull) = f
+        if fname == name {
+            found = Some((fname, fargs, fret, fnull))
+        }
+    }
+    let picked = match found {
+        Some(f) => f
+        None => {
+            if name == s("unnest") || name == s("generate_series") || name == s("jsonb_array_elements") || name == s("json_array_elements") || name == s("regexp_matches") || name == s("jsonb_each") {
+                return Err(sql.unsupported(msg3("the set-returning function ", name, ""), n.pos))
+            }
+            return Err(sql.unsupported(msg3("the function ", name, ""), n.pos))
+        }
+    }
+    let (fname, fargs, fret, fnull) = picked
+    // count(*)
+    if n.qual == s("*") {
+        if name != s("count") { return Err(err(msg3("", name.copy(), "(*) is not valid"), n.pos)) }
+        return Ok(ty("int8", false))
+    }
+    // to_timestamp / round with different shapes
+    let specs = spec_args(fargs)
+    let mut min_args: usize = 0
+    let mut max_args: usize = 0
+    let mut variadic = false
+    for a in specs {
+        if a == s("...") {
+            variadic = true
+        } else if strings_ends(a.copy(), "?") {
+            max_args += 1
+        } else {
+            min_args += 1
+            max_args += 1
+        }
+    }
+    if variadic {
+        // the last spec before ... repeats; at least that many as before it
+        max_args = 1000
+        if min_args > 0 && !(name == s("concat") || name == s("jsonb_build_object") || name == s("json_build_object") || name == s("jsonb_build_array")) { min_args = min_args }
+    }
+    if name == s("coalesce") || name == s("greatest") || name == s("least") || name == s("concat") || name == s("concat_ws") || name == s("format") { min_args = 1 }
+    if name == s("jsonb_build_object") || name == s("json_build_object") || name == s("jsonb_build_array") { min_args = 0 }
+    if n.kids.len() < min_args || n.kids.len() > max_args {
+        let mut m = s("wrong number of arguments for ")
+        m.append(name.copy())
+        return Err(err(m, n.pos))
+    }
+    let mut args: List[Ty] = List.new()
+    for a in n.kids { args.push(infer(inout ctx, a.copy())?) }
+    // the polymorphic type
+    let mut t_ty = unknown()
+    let mut i: usize = 0
+    while i < args.len() {
+        let sp = spec_for(specs.copy(), i)
+        if sp == s("T") || sp == s("T?") {
+            if args[i].param == 0 { t_ty = unify(t_ty, args[i].copy(), n.pos)? }
+        }
+        i += 1
+    }
+    if t_ty.lit { t_ty = ty("text", false) }
+    i = 0
+    while i < args.len() {
+        let sp = spec_for(specs.copy(), i)
+        let base = if strings_ends(sp.copy(), "?") { sp.slice(0, sp.len() - 1) } else { sp.copy() }
+        if base == s("T") {
+            bind_if_param(inout ctx, args[i].copy(), t_ty.copy(), false, n.pos)?
+        } else if base != s("any") && base != s("arr") && base != s("...") {
+            bind_if_param(inout ctx, args[i].copy(), ty_s(base.copy(), false), false, n.pos)?
+            if !is_unknown(args[i].copy()) && !args[i].lit && args[i].param == 0 && !compatible(args[i].copy(), ty_s(base.copy(), false)) {
+                let mut m = s("function ")
+                m.append(name.copy())
+                m.push_str(" does not accept an argument of type ")
+                m.append(show_ty(args[i].copy()))
+                return Err(err(m, n.pos))
+            }
+        }
+        i += 1
+    }
+    let mut any_null = false
+    let mut all_null = args.len() > 0
+    for a in args.copy() {
+        if a.nullable { any_null = true } else { all_null = false }
+    }
+    // the result type
+    let mut res = unknown()
+    if fret == s("T") {
+        res = t_ty.copy()
+        if is_unknown(res.copy()) { return Err(err(s("cannot infer the type of the arguments; add a cast"), n.pos)) }
+        // an array argument keeps its dimension
+        if args.len() > 0 && args[0].array { res.array = true }
+    } else if fret == s("arrT") {
+        if fname == s("array_agg") {
+            if is_unknown(t_ty.copy()) { return Err(err(s("cannot infer the type of the arguments; add a cast"), n.pos)) }
+            res = Ty(t_ty.ty.copy(), true, false, false, 0)
+        } else {
+            let a0 = if args[0].array { args[0].copy() } else { args[args.len() - 1].copy() }
+            res = Ty(a0.ty.copy(), true, false, false, 0)
+        }
+    } else if fret == s("textarr") {
+        res = Ty(s("text"), true, false, false, 0)
+    } else if fret == s("sum") {
+        if is_unknown(t_ty.copy()) { return Err(err(s("cannot infer the type of the argument of sum; add a cast"), n.pos)) }
+        if t_ty.ty == s("int2") || t_ty.ty == s("int4") { res = ty("int8", false) } else if t_ty.ty == s("int8") || t_ty.ty == s("numeric") { res = ty("numeric", false) } else if t_ty.ty == s("float4") || t_ty.ty == s("float8") || t_ty.ty == s("interval") || t_ty.ty == s("money") { res = ty_s(t_ty.ty.copy(), false) } else { return Err(err(msg3("function sum(", show_ty(t_ty.copy()), ") does not exist"), n.pos)) }
+    } else if fret == s("avg") {
+        if is_unknown(t_ty.copy()) { return Err(err(s("cannot infer the type of the argument of avg; add a cast"), n.pos)) }
+        if t_ty.ty == s("int2") || t_ty.ty == s("int4") || t_ty.ty == s("int8") || t_ty.ty == s("numeric") { res = ty("numeric", false) } else if t_ty.ty == s("float4") || t_ty.ty == s("float8") { res = ty("float8", false) } else if t_ty.ty == s("interval") { res = ty("interval", false) } else { return Err(err(msg3("function avg(", show_ty(t_ty.copy()), ") does not exist"), n.pos)) }
+    } else {
+        res = ty_s(fret.copy(), false)
+    }
+    // ceil, floor, round, trunc and sign exist for float8 and numeric only: an integer argument becomes float8
+    // (numeric when round or trunc also take a number of digits)
+    if (fname == s("ceil") || fname == s("ceiling") || fname == s("floor") || fname == s("round") || fname == s("trunc") || fname == s("sign")) && schema.is_integer(t_ty.ty.copy()) && !t_ty.array {
+        res = ty_s(if args.len() > 1 { s("numeric") } else { s("float8") }, false)
+    }
+    if fname == s("date_trunc") && (t_ty.ty == s("date")) { res = ty("timestamp", false) }
+    if fname == s("max") || fname == s("min") || fname == s("sum") || fname == s("avg") {
+        if t_ty.array { return Err(sql.unsupported(msg3("an aggregate over arrays: ", name, ""), n.pos)) }
+    }
+    let nl = if fnull == s("never") { false } else if fnull == s("always") { true } else if fnull == s("coalesce") { all_null } else { any_null }
+    res.nullable = nl
+    res.lit = false
+    res.param = 0
+    Ok(res)
+}
+
+// ---------------------------------------------------------------------------------- statements
+
+/// The column name PostgreSQL gives an expression in a select list: the column, the function, the
+/// type of a cast of something else, `?column?` for the rest.
+fn figure_name(n: parse.Node) -> String {
+    let k = n.kind
+    if k == parse.N_COL { return n.name.copy() }
+    if k == parse.N_FUNC { return n.name.copy() }
+    if k == parse.N_CAST {
+        let inner = figure_name_strength(n.kids[0].copy())
+        if inner.len() > 0 { return inner }
+        return n.name.copy()
+    }
+    if k == parse.N_CASE { return s("case") }
+    if k == parse.N_ARRAY { return s("array") }
+    if k == parse.N_INDEX { return figure_name(n.kids[0].copy()) }
+    if k == parse.N_BOOL { return s("bool") }
+    s("?column?")
+}
+
+/// The name of the expression when it is a column or a function (PostgreSQL's strength 2), else "".
+fn figure_name_strength(n: parse.Node) -> String {
+    let k = n.kind
+    if k == parse.N_COL || k == parse.N_FUNC || k == parse.N_CASE || k == parse.N_ARRAY { return figure_name(n) }
+    if k == parse.N_CAST || k == parse.N_INDEX { return figure_name(n) }
+    s("")
+}
+
+fn out_of(name: String, t: Ty, n: parse.Node) -> Result[OutCol, sql.Error] {
+    let mut r = t.copy()
+    if r.param > 0 && is_unknown(r.copy()) {
+        return Err(err(msg3("could not determine the type of parameter $", r.param.to_string(), " in the select list; add a cast"), n.pos))
+    }
+    if is_unknown(r.copy()) || r.lit {
+        return Ok(OutCol(name, s("text"), false, is_unknown(r.copy())))
+    }
+    Ok(OutCol(name, r.ty.copy(), r.array, r.nullable))
+}
+
+fn expand_items(inout ctx: Ctx, items: List[parse.SelItem], using_joins: bool) -> Result[List[OutCol], sql.Error] {
+    let mut cols: List[OutCol] = List.new()
+    for it in items {
+        if it.expr.kind == parse.N_STAR {
+            if ctx.sources.len() == 0 { return Err(err(s("SELECT * with no tables specified is not valid"), it.expr.pos)) }
+            if using_joins { return Err(sql.unsupported(s("* with a JOIN ... USING (list the columns)"), it.expr.pos)) }
+            let mut matched = false
+            for src in ctx.sources.copy() {
+                if it.expr.qual.len() == 0 || src.alias == it.expr.qual {
+                    matched = true
+                    for c in src.cols {
+                        let t = col_ty(c.copy(), src.nullable, it.expr.pos, ctx.sch.copy())?
+                        cols.push(OutCol(c.name.copy(), t.ty.copy(), t.array, t.nullable))
+                    }
+                }
+            }
+            if !matched { return Err(err(msg3("missing FROM-clause entry for table \"", it.expr.qual.copy(), "\""), it.expr.pos)) }
+        } else {
+            let t = infer(inout ctx, it.expr.copy())?
+            let name = if it.alias.len() > 0 { it.alias.copy() } else { figure_name(it.expr.copy()) }
+            cols.push(out_of(name, t, it.expr.copy())?)
+        }
+    }
+    Ok(cols)
+}
+
+fn expect_bool(inout ctx: Ctx, e: parse.Node, what: str) -> Result[(), sql.Error] {
+    let t = infer(inout ctx, e.copy())?
+    if t.param > 0 && is_unknown(t.copy()) {
+        bind(inout ctx, t.param, ty("bool", false), false, e.pos)?
+        return Ok(())
+    }
+    if !is_unknown(t.copy()) && !(t.ty == s("bool") && !t.array) {
+        let mut m = s("argument of ")
+        m.push_str(what)
+        m.push_str(" must be type boolean, not type ")
+        m.append(show_ty(t))
+        return Err(err(m, e.pos))
+    }
+    Ok(())
+}
+
+fn expect_integer(inout ctx: Ctx, e: parse.Node, what: str) -> Result[(), sql.Error] {
+    let t = infer(inout ctx, e.copy())?
+    if t.param > 0 && is_unknown(t.copy()) {
+        bind(inout ctx, t.param, ty("int8", false), false, e.pos)?
+        return Ok(())
+    }
+    if !is_unknown(t.copy()) && (numeric_rank(t.ty.copy()) == 0 || t.array) && !t.lit {
+        let mut m = s("argument of ")
+        m.push_str(what)
+        m.push_str(" must be type bigint, not type ")
+        m.append(show_ty(t))
+        return Err(err(m, e.pos))
+    }
+    Ok(())
+}
+
+fn add_source(inout ctx: Ctx, src: Source, at: usize) -> Result[(), sql.Error] {
+    for o in ctx.sources.copy() {
+        if o.alias == src.alias { return Err(err(msg3("table name \"", src.alias.copy(), "\" specified more than once"), at)) }
+    }
+    ctx.sources.push(src)
+    Ok(())
+}
+
+fn finish_params(ctx: Ctx, at: usize) -> Result[List[ParamInfo], sql.Error] {
+    for p in ctx.params.copy() {
+        if !p.bound {
+            let mut m = s("could not determine the type of parameter $")
+            m.append(String.from_int(p.index as i64))
+            m.push_str(": add a cast ($")
+            m.append(String.from_int(p.index as i64))
+            m.push_str("::type) or use it where a type is known")
+            return Err(err(m, at))
+        }
+    }
+    Ok(ctx.params)
+}
+
+fn check_select(inout ctx: Ctx, q: parse.Select) -> Result[Info, sql.Error] {
+    let mut using_joins = false
+    for fi in q.from.copy() {
+        let src_nullable = fi.join == parse.J_LEFT || fi.join == parse.J_FULL
+        if fi.join == parse.J_RIGHT || fi.join == parse.J_FULL {
+            let mut i: usize = 0
+            while i < ctx.sources.len() {
+                ctx.sources[i].nullable = true
+                i += 1
+            }
+        }
+        let src = source_of_table(ctx.sch.copy(), fi.table.copy(), fi.alias.copy(), src_nullable, fi.pos)?
+        add_source(inout ctx, src, fi.pos)?
+        if fi.has_on { expect_bool(inout ctx, fi.on.copy(), "JOIN/ON")? }
+        if fi.using.len() > 0 {
+            using_joins = true
+            for u in fi.using.copy() {
+                let mut cnt = 0
+                for so in ctx.sources.copy() {
+                    for c in so.cols { if c.name == u { cnt += 1 } }
+                }
+                if cnt < 2 { return Err(err(msg3("column \"", u, "\" specified in USING clause does not exist in both tables"), fi.pos)) }
+            }
+        }
+    }
+    if q.has_where { expect_bool(inout ctx, q.cond.copy(), "WHERE")? }
+    for g in q.group.copy() {
+        if g.kind != parse.N_INT { let t = infer(inout ctx, g.copy())? }
+    }
+    if q.has_having { expect_bool(inout ctx, q.having.copy(), "HAVING")? }
+    let cols = expand_items(inout ctx, q.items.copy(), using_joins)?
+    let mut names: List[String] = List.new()
+    for c in cols.copy() { names.push(c.name.copy()) }
+    for o in q.order.copy() {
+        if o.kind == parse.N_INT {
+            let idx = strings_parse(o.name.copy()).unwrap_or(0)
+            if idx < 1 || (idx as usize) > cols.len() { return Err(err(msg3("ORDER BY position ", o.name.copy(), " is not in select list"), o.pos)) }
+        } else if o.kind == parse.N_COL && o.qual.len() == 0 && names.contains(o.name.copy()) {
+            let ok = true
+        } else {
+            let t = infer(inout ctx, o.copy())?
+            if t.param > 0 && is_unknown(t.copy()) { return Err(err(s("cannot infer the type of a parameter in ORDER BY; add a cast"), o.pos)) }
+        }
+    }
+    if q.has_limit { expect_integer(inout ctx, q.limit.copy(), "LIMIT")? }
+    if q.has_offset { expect_integer(inout ctx, q.offset.copy(), "OFFSET")? }
+    let params = finish_params(ctx.copy(), 0)?
+    Ok(Info(K_SELECT, params, cols))
+}
+
+fn target_column(t: schema.Table, name: String, at: usize) -> Result[usize, sql.Error] {
+    match schema.find_column(t.copy(), name.copy()) {
+        Some(i) => Ok(i)
+        None => {
+            let mut m = s("column \"")
+            m.append(name.copy())
+            m.push_str("\" of relation \"")
+            m.append(t.name.copy())
+            m.push_str("\" does not exist")
+            let mut cands: List[String] = List.new()
+            for c in t.columns { cands.push(c.name.copy()) }
+            m.append(similar_hint(name, cands))
+            Err(err(m, at))
+        }
+    }
+}
+
+/// Checks `value` as the value for column `col`: binds a parameter to the column's type (NULL allowed
+/// where the column allows it) and checks that the types fit.
+fn check_assign(inout ctx: Ctx, col: schema.Column, value: parse.Node, at: usize) -> Result[(), sql.Error] {
+    if value.kind == parse.N_DEFAULT { return Ok(()) }
+    let t = infer(inout ctx, value.copy())?
+    let col_t = Ty(col.ty.copy(), col.array, false, false, 0)
+    let nl = !(col.not_null || col.pk)
+    if t.param > 0 {
+        if is_unknown(t.copy()) {
+            bind(inout ctx, t.param, col_t, nl, at)?
+        } else {
+            bind(inout ctx, t.param, t.copy(), nl, at)?
+            if !compatible(col_t.copy(), t.copy()) { return Err(assign_error(col.copy(), t, at)) }
+        }
+        return Ok(())
+    }
+    if value.kind == parse.N_NULL {
+        if !nl {
+            return Err(err(msg3("null value in column \"", col.name.copy(), "\" violates not-null constraint"), at))
+        }
+        return Ok(())
+    }
+    if !compatible(col_t, t.copy()) { return Err(assign_error(col.copy(), t, at)) }
+    Ok(())
+}
+
+fn assign_error(col: schema.Column, t: Ty, at: usize) -> sql.Error {
+    let mut m = s("column \"")
+    m.append(col.name.copy())
+    m.push_str("\" is of type ")
+    m.append(schema.type_text(col.ty.copy(), col.array))
+    m.push_str(" but expression is of type ")
+    m.append(show_ty(t))
+    err(m, at)
+}
+
+fn returning_cols(inout ctx: Ctx, items: List[parse.SelItem]) -> Result[List[OutCol], sql.Error] {
+    if items.len() == 0 { return Ok(List.new()) }
+    expand_items(inout ctx, items, false)
+}
+
+fn check_insert(inout ctx: Ctx, q: parse.Insert) -> Result[Info, sql.Error] {
+    let src = source_of_table(ctx.sch.copy(), q.table.copy(), q.table.copy(), false, q.pos)?
+    add_source(inout ctx, src, q.pos)?
+    let ti = schema.find_table(ctx.sch.copy(), q.table.copy()).unwrap()
+    let t = ctx.sch.tables[ti].copy()
+    let mut targets: List[usize] = List.new()
+    if q.columns.len() == 0 {
+        for i in 0..t.columns.len() { targets.push(i) }
+    } else {
+        for cn in q.columns.copy() {
+            let i = target_column(t.copy(), cn.copy(), q.pos)?
+            if targets.contains(i) { return Err(err(msg3("column \"", cn, "\" specified more than once"), q.pos)) }
+            targets.push(i)
+        }
+    }
+    for row in q.rows.copy() {
+        if row.len() != targets.len() {
+            let mut m = s("INSERT has ")
+            m.append(String.from_int(row.len() as i64))
+            m.push_str(" values but ")
+            m.append(String.from_int(targets.len() as i64))
+            m.push_str(" target columns")
+            return Err(err(m, q.pos))
+        }
+        let mut k: usize = 0
+        while k < row.len() {
+            check_assign(inout ctx, t.columns[targets[k]].copy(), row[k].copy(), row[k].pos)?
+            k += 1
+        }
+    }
+    // a NOT NULL column without a default must be given
+    if q.rows.len() > 0 || true {
+        for i in 0..t.columns.len() {
+            let c = t.columns[i].copy()
+            if (c.not_null || c.pk) && !c.has_default && !targets.contains(i) {
+                return Err(err(msg3("null value in column \"", c.name.copy(), "\" violates not-null constraint (it has no default and INSERT does not give it)"), q.pos))
+            }
+        }
+    }
+    if q.has_conflict {
+        for cn in q.conflict.target.copy() { let i = target_column(t.copy(), cn, q.pos)? }
+        if !q.conflict.do_nothing {
+            let ex = Source(s("excluded"), q.table.copy(), t.columns.copy(), false)
+            ctx.sources.push(ex)
+            for a in q.conflict.sets.copy() {
+                let i = target_column(t.copy(), a.column.copy(), a.pos)?
+                check_assign(inout ctx, t.columns[i].copy(), a.value.copy(), a.pos)?
+            }
+            if q.conflict.has_where { expect_bool(inout ctx, q.conflict.cond.copy(), "ON CONFLICT WHERE")? }
+            ctx.sources.pop()
+        }
+    }
+    let cols = returning_cols(inout ctx, q.returning.copy())?
+    let params = finish_params(ctx.copy(), q.pos)?
+    Ok(Info(K_INSERT, params, cols))
+}
+
+fn check_update(inout ctx: Ctx, q: parse.Update) -> Result[Info, sql.Error] {
+    let src = source_of_table(ctx.sch.copy(), q.table.copy(), q.alias.copy(), false, q.pos)?
+    add_source(inout ctx, src, q.pos)?
+    let ti = schema.find_table(ctx.sch.copy(), q.table.copy()).unwrap()
+    let t = ctx.sch.tables[ti].copy()
+    for a in q.sets.copy() {
+        let i = target_column(t.copy(), a.column.copy(), a.pos)?
+        check_assign(inout ctx, t.columns[i].copy(), a.value.copy(), a.pos)?
+    }
+    if q.has_where { expect_bool(inout ctx, q.cond.copy(), "WHERE")? }
+    let cols = returning_cols(inout ctx, q.returning.copy())?
+    let params = finish_params(ctx.copy(), q.pos)?
+    Ok(Info(K_UPDATE, params, cols))
+}
+
+fn check_delete(inout ctx: Ctx, q: parse.Delete) -> Result[Info, sql.Error] {
+    let src = source_of_table(ctx.sch.copy(), q.table.copy(), q.alias.copy(), false, q.pos)?
+    add_source(inout ctx, src, q.pos)?
+    if q.has_where { expect_bool(inout ctx, q.cond.copy(), "WHERE")? }
+    let cols = returning_cols(inout ctx, q.returning.copy())?
+    let params = finish_params(ctx.copy(), q.pos)?
+    Ok(Info(K_DELETE, params, cols))
+}
+
+/// Checks one parsed statement against the schema.
+pub fn check(sch: schema.Schema, st: parse.Stmt) -> Result[Info, sql.Error] {
+    let mut ctx = Ctx(sch, List.new(), List.new(), List.new())
+    match st {
+        parse.Sel(q) => check_select(inout ctx, q)
+        parse.Ins(q) => check_insert(inout ctx, q)
+        parse.Upd(q) => check_update(inout ctx, q)
+        parse.Del(q) => check_delete(inout ctx, q)
+    }
+}
+
+/// Lexes, parses and checks `text` (with `$n` parameters).
+pub fn check_text(sch: schema.Schema, text: String) -> Result[Info, sql.Error] {
+    let st = parse.parse_text(text)?
+    check(sch, st)
+}
+
+/// An `Info` as text:`params: $1 int8, $2 text?` and `columns: id int8, email text?` (`?` is nullable).
+pub fn describe(i: Info) -> String {
+    let mut out = s("params:")
+    for p in i.params {
+        out.push_str(" $")
+        out.append(String.from_int(p.index as i64))
+        out.push_str(" ")
+        out.append(schema.type_text(p.ty.copy(), p.array))
+        if p.nullable { out.push_str("?") }
+        out.push_str(";")
+    }
+    out.push_str(" columns:")
+    for c in i.cols {
+        out.push_str(" ")
+        out.append(c.name.copy())
+        out.push_str(" ")
+        out.append(schema.type_text(c.ty.copy(), c.array))
+        if c.nullable { out.push_str("?") }
+        out.push_str(";")
+    }
+    out
+}
+
+fn spec_for(specs: List[String], i: usize) -> String {
+    if i < specs.len() && specs[i] != s("...") { return specs[i].copy() }
+    // beyond the list: the last spec repeats when the list ends with `...`
+    if specs.len() >= 2 && specs[specs.len() - 1] == s("...") { return specs[specs.len() - 2].copy() }
+    s("any")
+}

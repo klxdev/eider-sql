@@ -1,0 +1,211 @@
+//! sql.schema: the model of a database schema that the migrations build and the checker reads, and
+//! the PostgreSQL types it knows.
+//!
+//! A type is its canonical lowercase name (`int4`, `text`, `timestamptz`, ...) plus whether it is an
+//! array. `varchar`, `char` and `citext` are `text`; `int` is `int4`; `serial` is `int4` with a default.
+
+import std.strings
+import sql
+
+pub type Column = {
+    name: String,
+    ty: String,
+    array: bool,
+    not_null: bool,
+    has_default: bool,
+    pk: bool
+}
+
+pub type Table = { name: String, columns: List[Column], pk: List[String], uniques: List[List[String]], fks: List[ForeignKey] }
+
+pub type ForeignKey = { columns: List[String], table: String, refs: List[String] }
+
+pub type EnumType = { name: String, labels: List[String] }
+
+pub type Index = { name: String, table: String, unique: bool }
+
+pub type Schema = { tables: List[Table], enums: List[EnumType], indexes: List[Index], notes: List[String] }
+
+pub fn empty() -> Schema { Schema(List.new(), List.new(), List.new(), List.new()) }
+
+pub fn find_table(s: Schema, name: String) -> Option[usize] {
+    let mut i: usize = 0
+    while i < s.tables.len() {
+        if s.tables[i].name == name { return Some(i) }
+        i += 1
+    }
+    None
+}
+
+pub fn find_column(t: Table, name: String) -> Option[usize] {
+    let mut i: usize = 0
+    while i < t.columns.len() {
+        if t.columns[i].name == name { return Some(i) }
+        i += 1
+    }
+    None
+}
+
+pub fn find_enum(s: Schema, name: String) -> Option[usize] {
+    let mut i: usize = 0
+    while i < s.enums.len() {
+        if s.enums[i].name == name { return Some(i) }
+        i += 1
+    }
+    None
+}
+
+pub fn column(name: String, ty: String, array: bool) -> Column {
+    Column(name, ty, array, false, false, false)
+}
+
+// ------------------------------------------------------------------------------------- types
+
+/// The canonical name of a PostgreSQL type given by `name` (lowercase, one or more words joined by
+/// single spaces, no length or `[]`), or `None` when the checker does not know it.
+pub fn canonical(name: String) -> Option[String] {
+    let n = name.copy()
+    let pairs = List[
+        ("bool", "bool"), ("boolean", "bool"),
+        ("int2", "int2"), ("smallint", "int2"), ("smallserial", "int2"), ("serial2", "int2"),
+        ("int4", "int4"), ("int", "int4"), ("integer", "int4"), ("serial", "int4"), ("serial4", "int4"),
+        ("int8", "int8"), ("bigint", "int8"), ("bigserial", "int8"), ("serial8", "int8"),
+        ("float4", "float4"), ("real", "float4"), ("float8", "float8"), ("double precision", "float8"),
+        ("numeric", "numeric"), ("decimal", "numeric"),
+        ("text", "text"), ("varchar", "text"), ("character varying", "text"), ("char", "text"),
+        ("character", "text"), ("bpchar", "text"), ("name", "text"), ("citext", "text"),
+        ("bytea", "bytea"), ("uuid", "uuid"), ("json", "json"), ("jsonb", "jsonb"),
+        ("date", "date"), ("time", "time"), ("time without time zone", "time"),
+        ("timetz", "timetz"), ("time with time zone", "timetz"),
+        ("timestamp", "timestamp"), ("timestamp without time zone", "timestamp"),
+        ("timestamptz", "timestamptz"), ("timestamp with time zone", "timestamptz"),
+        ("interval", "interval"), ("inet", "inet"), ("cidr", "cidr"), ("macaddr", "macaddr"),
+        ("money", "money"), ("oid", "oid"), ("xml", "xml")
+    ]
+    for p in pairs {
+        let (a, b) = p
+        if n == String.from(a) { return Some(String.from(b)) }
+    }
+    None
+}
+
+/// Whether `ty` is a type name `canonical` produces.
+pub fn is_builtin(ty: String) -> bool {
+    match canonical(ty.copy()) {
+        Some(c) => c == ty
+        None => false
+    }
+}
+
+pub fn is_integer(ty: String) -> bool { ty == String.from("int2") || ty == String.from("int4") || ty == String.from("int8") || ty == String.from("oid") }
+pub fn is_float(ty: String) -> bool { ty == String.from("float4") || ty == String.from("float8") }
+pub fn is_numeric_type(ty: String) -> bool { is_integer(ty.copy()) || is_float(ty.copy()) || ty == String.from("numeric") || ty == String.from("money") }
+pub fn is_text(ty: String) -> bool { ty == String.from("text") }
+pub fn is_json(ty: String) -> bool { ty == String.from("json") || ty == String.from("jsonb") }
+pub fn is_temporal(ty: String) -> bool { ty == String.from("date") || ty == String.from("time") || ty == String.from("timetz") || ty == String.from("timestamp") || ty == String.from("timestamptz") }
+
+/// The PostgreSQL type OIDs of the canonical types (what Describe answers); 0 for none.
+pub fn oid_of(ty: String, array: bool) -> u32 {
+    let b: u32 = base_oid(ty)
+    if !array { return b }
+    array_oid(b)
+}
+
+fn base_oid(ty: String) -> u32 {
+    let pairs = List[
+        ("bool", 16), ("bytea", 17), ("int8", 20), ("int2", 21), ("int4", 23), ("text", 25), ("oid", 26),
+        ("json", 114), ("xml", 142), ("float4", 700), ("float8", 701), ("inet", 869), ("cidr", 650),
+        ("macaddr", 829), ("money", 790), ("date", 1082), ("time", 1083), ("timestamp", 1114),
+        ("timestamptz", 1184), ("interval", 1186), ("timetz", 1266), ("numeric", 1700), ("uuid", 2950), ("jsonb", 3802)
+    ]
+    for p in pairs {
+        let (a, b) = p
+        if ty == String.from(a) { return b as u32 }
+    }
+    0
+}
+
+fn array_oid(b: u32) -> u32 {
+    let pairs = List[(16, 1000), (17, 1001), (20, 1016), (21, 1005), (23, 1007), (25, 1009), (26, 1028), (114, 199), (700, 1021), (701, 1022), (1082, 1182), (1083, 1183), (1114, 1115), (1184, 1185), (1186, 1187), (1266, 1270), (1700, 1231), (2950, 2951), (3802, 3807), (869, 1041), (650, 651), (829, 1040)]
+    for p in pairs {
+        let (a, c) = p
+        if b == (a as u32) { return c as u32 }
+    }
+    0
+}
+
+/// The canonical (type, array) a server OID stands for, mapping varchar and bpchar to `text`;
+/// `None` for an OID the checker does not model.
+pub fn type_of_oid(oid: u32) -> Option[(String, bool)] {
+    let names = List["bool", "bytea", "int8", "int2", "int4", "text", "oid", "json", "float4", "float8", "inet", "cidr", "macaddr", "money", "date", "time", "timestamp", "timestamptz", "interval", "timetz", "numeric", "uuid", "jsonb", "xml"]
+    for n in names {
+        if base_oid(String.from(n)) == oid { return Some((String.from(n), false)) }
+        let a = array_oid(base_oid(String.from(n)))
+        if a != 0 && a == oid { return Some((String.from(n), true)) }
+    }
+    if oid == 1042 || oid == 1043 || oid == 19 { return Some((String.from("text"), false)) }
+    if oid == 1015 || oid == 1014 { return Some((String.from("text"), true)) }
+    None
+}
+
+/// The schema as text, one table per block (for tests and `eider-sql schema`).
+pub fn describe(s: Schema) -> String {
+    let mut out = String.from("")
+    for t in s.tables {
+        out.push_str("table ")
+        out.append(t.name.copy())
+        out.push_str("\n")
+        for c in t.columns {
+            out.push_str("  ")
+            out.append(c.name.copy())
+            out.push_str(" ")
+            out.append(type_text(c.ty.copy(), c.array))
+            if c.not_null { out.push_str(" not null") }
+            if c.has_default { out.push_str(" default") }
+            if c.pk { out.push_str(" pk") }
+            out.push_str("\n")
+        }
+        for f in t.fks {
+            out.push_str("  fk (")
+            out.append(strings.join(f.columns.copy(), ", "))
+            out.push_str(") -> ")
+            out.append(f.table.copy())
+            out.push_str("(")
+            out.append(strings.join(f.refs.copy(), ", "))
+            out.push_str(")\n")
+        }
+        for u in t.uniques {
+            out.push_str("  unique (")
+            out.append(strings.join(u.copy(), ", "))
+            out.push_str(")\n")
+        }
+    }
+    for e in s.enums {
+        out.push_str("enum ")
+        out.append(e.name.copy())
+        out.push_str(" (")
+        out.append(strings.join(e.labels.copy(), ", "))
+        out.push_str(")\n")
+    }
+    for ix in s.indexes {
+        if ix.unique { out.push_str("unique ") }
+        out.push_str("index ")
+        out.append(ix.name.copy())
+        out.push_str(" on ")
+        out.append(ix.table.copy())
+        out.push_str("\n")
+    }
+    for n in s.notes {
+        out.push_str("note: ")
+        out.append(n.copy())
+        out.push_str("\n")
+    }
+    out
+}
+
+/// "int8", "int8[]".
+pub fn type_text(ty: String, array: bool) -> String {
+    let mut s = ty.copy()
+    if array { s.push_str("[]") }
+    s
+}

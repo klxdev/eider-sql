@@ -1,0 +1,70 @@
+// The generator: names, literals, the query file reader, golden output (tests/data/gen/*.ei are what `eider-sql gen`
+// writes for tests/data), and the errors of generation. The golden files are also compiled and run against a
+// server by pg_gen_test.
+
+import sql
+import sql.gen
+import sql.migration
+import sql.project
+import sql.queryfile
+
+fn s(x: str) -> String { String.from(x) }
+
+fn main() uses io, fs {
+    let a1 = gen.snake(s("GetUser"))
+    let a2 = gen.snake(s("get_user"))
+    let a3 = gen.snake(s("HTTPServer"))
+    let a4 = gen.snake(s("ListUsers2"))
+    print("{a1} {a2} {a3} {a4}")
+    let b1 = gen.pascal(s("get_user"))
+    let b2 = gen.pascal(s("GetUser"))
+    print("{b1} {b2}")
+    print(gen.literal(s("SELECT \"a\", '{{x}}' \\ \n\t é")))
+
+    // query files
+    let src = s("-- name: A :one\n-- doc line\nSELECT :x::int8, :y, :x;\n\n-- name: b_two :many\nSELECT $1, $3, $2;\n")
+    match queryfile.parse_file(src) {
+        Ok(qs) => {
+            for q in qs {
+                print("{q.name} {q.kind} names {q.param_names} doc {q.doc}")
+                print("  {q.text}")
+            }
+        }
+        Err(e) => print("error {e.msg}")
+    }
+    for bad in List["SELECT 1;", "-- name: A :one", "-- name: A :zzz\nSELECT 1;", "-- name: A :one\nSELECT :a, $1;", "-- name: A :one\nSELECT 1;\n-- name: A :one\nSELECT 2;"] {
+        match queryfile.parse_file(s(bad)) {
+            Ok(qs) => print("accepted: {bad}")
+            Err(e) => print("refused: {e.msg}")
+        }
+    }
+
+    // golden: regenerate in memory and compare with the files
+    let ms = project.load_migrations(s("tests/data/migrations")).unwrap()
+    let sch = project.schema_of(s("tests/data/migrations"), ms.copy()).unwrap()
+    let checked = project.check_queries(s("tests/data/queries"), sch.copy()).unwrap()
+    for c in checked {
+        let text = project.generate_one(ms.copy(), sch.copy(), c.copy()).unwrap()
+        let want = project.read_text("tests/data/gen/{project.module_name(c.file.copy())}").unwrap()
+        print("{c.file}: {text.len()} bytes, matches the golden file: {text == want}, hash {project.header_hash(text.copy()).unwrap()}")
+    }
+
+    // errors of generation
+    let two = s("-- name: Dup :one\nSELECT u.id, o.id FROM users u JOIN orders o ON o.user_id = u.id LIMIT 1;\n")
+    let odd = s("-- name: Odd :many\nSELECT id + 1 FROM users;\n")
+    let interval = s("-- name: Iv :many\nSELECT now() - created_at AS age FROM users;\n")
+    let kw = s("-- name: Kw :many\nSELECT id AS type, email AS match FROM users;\n")
+    let prm = s("-- name: Pm :exec\nUPDATE users SET name = :type, age = :c WHERE id = :dl;\n")
+    for text in List[two, odd, interval, kw, prm] {
+        let q = queryfile.parse_file(text.copy()).unwrap()
+        match queryfile.check_query(sch.copy(), q[0].copy()) {
+            Ok(info) => {
+                match gen.generate(s("x.sql"), s("0"), sch.copy(), q, List[info]) {
+                    Ok(t) => print("generated {q[0].name}:\n{t}")
+                    Err(e) => print("gen error: {e.msg}")
+                }
+            }
+            Err(e) => print("check error: {e.msg}")
+        }
+    }
+}

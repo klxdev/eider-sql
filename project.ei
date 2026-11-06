@@ -1,0 +1,275 @@
+//! sql.project: a project on disk (needs `fs`): a directory of migrations and a directory of annotated
+//! `.sql` query files. Loads and checks them, and writes the generated modules. The command line
+//! (`bin/main.ei`) is a thin layer over this.
+//!
+//! Layout: `migrations/001_create_users.sql`, ... (see `sql.migration`) and `queries/users.sql`, ... (see
+//! `sql.queryfile`); `gen` writes `<out>/users.ei` for each query file. Errors are texts
+//! `file:line:col: message`, ready to print.
+
+import std.fs
+import std.strings
+import std.utf8
+import sql
+import sql.check
+import sql.ddl
+import sql.gen
+import sql.migration
+import sql.queryfile
+import sql.schema
+
+fn s(x: str) -> String { String.from(x) }
+
+pub fn read_text(path: String) -> Result[String, String] uses fs {
+    match fs.read(path.bytes()) {
+        Ok(b) => {
+            match String.from_bytes(b) {
+                Ok(t) => Ok(t)
+                Err(i) => {
+                    let mut m = path.copy()
+                    m.push_str(": not valid UTF-8 text (or it contains a NUL) at byte ")
+                    m.append(String.from_int(i as i64))
+                    Err(m)
+                }
+            }
+        }
+        Err(e) => {
+            let mut m = path.copy()
+            m.push_str(": ")
+            m.append(e)
+            Err(m)
+        }
+    }
+}
+
+fn join(dir: String, name: String) -> String {
+    let mut p = dir.copy()
+    if p.len() > 0 && p.byte(p.len() - 1) != 47 { p.push_str("/") }
+    p.append(name)
+    p
+}
+
+/// The `.sql` files of `dir` (names only), sorted.
+fn sql_files(dir: String) -> Result[List[String], String] uses fs {
+    let names = match fs.list(dir.bytes()) {
+        Ok(n) => n
+        Err(e) => {
+            let mut m = dir.copy()
+            m.push_str(": ")
+            m.append(e)
+            return Err(m)
+        }
+    }
+    let sorted = fs.sort(names)
+    let mut out: List[String] = List.new()
+    for n in sorted {
+        let name = utf8.lossy(n)
+        // fs.list may return paths; keep the last component
+        let mut base = name.copy()
+        let mut i = name.len()
+        while i > 0 {
+            if name.byte(i - 1) == 47 {
+                base = name.slice(i, name.len())
+                break
+            }
+            i -= 1
+        }
+        if strings.ends_with(base.copy(), ".sql") { out.push(base) }
+    }
+    Ok(out)
+}
+
+/// The migrations of `dir`, in version order.
+pub fn load_migrations(dir: String) -> Result[List[migration.Migration], String] uses fs {
+    let files = sql_files(dir.copy())?
+    let mut ms: List[migration.Migration] = List.new()
+    for f in files {
+        let path = join(dir.copy(), f.copy())
+        let text = read_text(path.copy())?
+        match migration.from_file(f.copy(), text) {
+            Ok(m) => { ms.push(m) }
+            Err(e) => {
+                let mut msg = path.copy()
+                msg.push_str(": ")
+                msg.append(e.msg)
+                return Err(msg)
+            }
+        }
+    }
+    match migration.order(ms) {
+        Ok(o) => Ok(o)
+        Err(e) => {
+            let mut msg = dir.copy()
+            msg.push_str(": ")
+            msg.append(e.msg)
+            Err(msg)
+        }
+    }
+}
+
+/// The schema the migrations build. Errors name the file, line and column.
+pub fn schema_of(dir: String, ms: List[migration.Migration]) -> Result[schema.Schema, String] {
+    let mut sch = schema.empty()
+    for m in ms {
+        match ddl.apply(sch.copy(), m.text.copy()) {
+            Ok(next) => { sch = next }
+            Err(e) => {
+                let mut label = join(dir.copy(), m.file.copy())
+                return Err(sql.format_error(label, m.text.copy(), e))
+            }
+        }
+    }
+    Ok(sch)
+}
+
+pub type Checked = {
+    file: String,
+    text: String,
+    queries: List[queryfile.Query],
+    infos: List[check.Info]
+}
+
+/// Reads and checks every query file of `dir` against `sch`. All the problems of all the files are
+/// returned together (one per query), not just the first.
+pub fn check_queries(dir: String, sch: schema.Schema) -> Result[List[Checked], List[String]] uses fs {
+    let mut problems: List[String] = List.new()
+    let mut out: List[Checked] = List.new()
+    let files = match sql_files(dir.copy()) {
+        Ok(f) => f
+        Err(e) => { return Err(List[e]) }
+    }
+    for f in files {
+        let path = join(dir.copy(), f.copy())
+        let text = match read_text(path.copy()) {
+            Ok(t) => t
+            Err(e) => {
+                problems.push(e)
+                continue
+            }
+        }
+        let qs = match queryfile.parse_file(text.copy()) {
+            Ok(q) => q
+            Err(e) => {
+                problems.push(sql.format_error(path.copy(), text.copy(), e))
+                continue
+            }
+        }
+        let mut infos: List[check.Info] = List.new()
+        let mut ok = true
+        for q in qs.copy() {
+            match queryfile.check_query(sch.copy(), q.copy()) {
+                Ok(info) => { infos.push(info) }
+                Err(e) => {
+                    ok = false
+                    let mut m = sql.format_error(path.copy(), text.copy(), e)
+                    m.push_str(" (in ")
+                    m.append(q.name.copy())
+                    m.push_str(")")
+                    problems.push(m)
+                }
+            }
+        }
+        if ok { out.push(Checked(f, text, qs, infos)) }
+    }
+    if problems.len() > 0 { return Err(problems) }
+    Ok(out)
+}
+
+/// The module text for a checked query file, with the fingerprint of the migrations and the file.
+pub fn generate_one(ms: List[migration.Migration], sch: schema.Schema, c: Checked) -> Result[String, String] {
+    let mut parts: List[String] = List.new()
+    for m in ms { parts.push(m.text.copy()) }
+    parts.push(c.text.copy())
+    let hash = gen.fingerprint(parts)
+    match gen.generate(c.file.copy(), hash, sch, c.queries.copy(), c.infos.copy()) {
+        Ok(t) => Ok(t)
+        Err(e) => Err(sql.format_error(c.file.copy(), c.text.copy(), e))
+    }
+}
+
+/// The module file name for a query file (`users.sql` -> `users.ei`).
+pub fn module_name(file: String) -> String {
+    let mut n = file.slice(0, file.len() - 4)
+    n.push_str(".ei")
+    n
+}
+
+/// The `// inputs: <hash>` of a generated file, if it has one.
+pub fn header_hash(text: String) -> Option[String] {
+    let marker = s("// inputs: ")
+    match strings.find(text.copy(), marker.copy()) {
+        Some(i) => {
+            let from = i + marker.len()
+            let mut j = from.copy()
+            while j < text.len() && text.byte(j) != 10 { j += 1 }
+            Some(text.slice(from, j))
+        }
+        None => None
+    }
+}
+
+/// Writes (or, with `check_only`, only compares) the generated module of every query file into `out`.
+/// Returns what it did, one line per file.
+pub fn gen_all(migrations: String, queries: String, out: String, check_only: bool) -> Result[List[String], List[String]] uses fs {
+    let ms = match load_migrations(migrations.copy()) {
+        Ok(m) => m
+        Err(e) => { return Err(List[e]) }
+    }
+    let sch = match schema_of(migrations.copy(), ms.copy()) {
+        Ok(x) => x
+        Err(e) => { return Err(List[e]) }
+    }
+    let checked = check_queries(queries.copy(), sch.copy())?
+    let mut report: List[String] = List.new()
+    let mut problems: List[String] = List.new()
+    for c in checked {
+        let text = match generate_one(ms.copy(), sch.copy(), c.copy()) {
+            Ok(t) => t
+            Err(e) => {
+                problems.push(e)
+                continue
+            }
+        }
+        let target = join(out.copy(), module_name(c.file.copy()))
+        if check_only {
+            match read_text(target.copy()) {
+                Ok(existing) => {
+                    if existing == text {
+                        report.push(msg2(target, s(": up to date")))
+                    } else {
+                        problems.push(msg2(target, s(": out of date (run `eider-sql gen`)")))
+                    }
+                }
+                Err(e) => { problems.push(msg2(target, s(": missing (run `eider-sql gen`)"))) }
+            }
+        } else {
+            let mut same = false
+            match read_text(target.copy()) {
+                Ok(existing) => { same = existing == text }
+                Err(e) => {}
+            }
+            if same {
+                report.push(msg2(target, s(": unchanged")))
+            } else {
+                match fs.mkdir_all(out.bytes()) {
+                    Ok(b) => {}
+                    Err(e) => {
+                        problems.push(msg2(out.copy(), msg2(s(": "), e)))
+                        continue
+                    }
+                }
+                match fs.write(target.bytes(), text.bytes()) {
+                    Ok(b) => { report.push(msg2(target, s(": written"))) }
+                    Err(e) => { problems.push(msg2(target, msg2(s(": "), e))) }
+                }
+            }
+        }
+    }
+    if problems.len() > 0 { return Err(problems) }
+    Ok(report)
+}
+
+fn msg2(a: String, b: String) -> String {
+    let mut m = a.copy()
+    m.append(b)
+    m
+}

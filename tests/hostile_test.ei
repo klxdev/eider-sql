@@ -1,0 +1,228 @@
+// Hostile input never traps: every prefix of valid statements, random mutations, token soup, deep nesting,
+// huge numbers, odd bytes, through the lexer, the DDL reader, the query parser, the checker and the query file reader.
+// The test prints how many inputs were refused and how many accepted; a trap would end it early.
+
+import sql
+import sql.check
+import sql.ddl
+import sql.lex
+import sql.parse
+import sql.queryfile
+import sql.schema
+
+const DDL: str = """
+CREATE TYPE mood AS ENUM ('a', 'b');
+CREATE TABLE users (id bigserial PRIMARY KEY, email text NOT NULL, name text, age int NOT NULL DEFAULT 1, m mood, tags text[], meta jsonb, created_at timestamptz NOT NULL DEFAULT now());
+CREATE TABLE orders (id bigserial PRIMARY KEY, user_id bigint NOT NULL REFERENCES users(id), total numeric NOT NULL, note text);
+ALTER TABLE users ADD COLUMN nick text;
+CREATE INDEX i ON users (lower(email), age DESC);
+"""
+
+fn valid_queries() -> List[str] {
+    List[
+        "SELECT id, email FROM users WHERE id = $1",
+        "SELECT u.id, o.total FROM users u LEFT JOIN orders o ON o.user_id = u.id WHERE u.age > $1 AND (u.name IS NULL OR u.email LIKE $2) ORDER BY u.id DESC LIMIT $3 OFFSET $4",
+        "SELECT count(*), sum(total), max(note) FROM orders GROUP BY user_id HAVING count(*) > 1",
+        "SELECT coalesce(name, 'x'), CASE WHEN age > 3 THEN 'a' ELSE 'b' END, id::text, meta->>'k', tags[1] FROM users WHERE id = ANY($1) AND id IN (1, 2, $2) AND created_at BETWEEN $3 AND $4",
+        "INSERT INTO users (email, name, age) VALUES ($1, $2, $3), ($4, NULL, 5) ON CONFLICT (email) DO UPDATE SET name = excluded.name RETURNING id",
+        "UPDATE users SET name = $1, age = age + 1 WHERE id = $2 RETURNING id, name",
+        "DELETE FROM orders WHERE user_id = $1 RETURNING *"
+    ]
+}
+
+/// A small deterministic generator.
+fn next(inout seed: u64) -> u64 {
+    seed = seed *% 6364136223846793005 +% 1442695040888963407
+    seed >> 33
+}
+
+fn run(src: String, sch: schema.Schema, inout ok: i64, inout bad: i64) {
+    match check.check_text(sch.copy(), src.copy()) {
+        Ok(i) => { ok += 1 }
+        Err(e) => { bad += 1 }
+    }
+}
+
+fn prefixes(sch: schema.Schema, inout ok: i64, inout bad: i64) {
+    for q in valid_queries() {
+        let text = String.from(q)
+        // every prefix that ends on a character boundary
+        let mut i: usize = 0
+        while i <= text.len() {
+            run(text.slice(0, i), sch.copy(), inout ok, inout bad)
+            i += 1
+        }
+    }
+}
+
+fn mutations(sch: schema.Schema, inout ok: i64, inout bad: i64) {
+    let mut seed: u64 = 12345
+    let alphabet = "abcdefghijklmnopqrstuvwxyz0123456789 \t\n,.;:()[]{{}}'\"$_*+-/<>=!|&%^~@#?\\"
+    let chars = alphabet.bytes()
+    for q in valid_queries() {
+        let base = String.from(q).bytes()
+        for round in 0..300 {
+            let mut b = base.copy()
+            let edits = (next(inout seed) % 4) + 1
+            for e in 0..edits {
+                let at = (next(inout seed) % (b.len() as u64)) as usize
+                let kind = next(inout seed) % 3
+                let ch = chars[(next(inout seed) % (chars.len() as u64)) as usize]
+                if kind == 0 {
+                    b[at] = ch
+                } else if kind == 1 {
+                    b.insert(at, ch)
+                } else {
+                    b.remove(at)
+                }
+            }
+            match String.from_bytes(b) {
+                Ok(t) => { run(t, sch.copy(), inout ok, inout bad) }
+                Err(_) => {}
+            }
+        }
+    }
+}
+
+fn soup(sch: schema.Schema, inout ok: i64, inout bad: i64) {
+    let vocab = List["select", "from", "where", "and", "or", "not", "null", "(", ")", ",", "users", "orders", "id", "email", "*", "=", "<", "$1", "$2", "1", "'x'", "join", "on", "left", "order", "by", "group", "having", "limit", "insert", "into", "values", "update", "set", "delete", "returning", "case", "when", "then", "else", "end", "in", "between", "is", "like", "as", "distinct", "count", "::", "int", "[", "]", ".", "u", "o", "+", "-", "any", "all", "exists", "with", "union", "over", "default", "on", "conflict", "do", "nothing", "excluded"]
+    let mut seed: u64 = 777
+    for round in 0..4000 {
+        let n = (next(inout seed) % 14) + 1
+        let mut t = String.from("")
+        for k in 0..n {
+            t.push_str(vocab[(next(inout seed) % (vocab.len() as u64)) as usize])
+            t.push_str(" ")
+        }
+        run(t, sch.copy(), inout ok, inout bad)
+    }
+}
+
+fn odd(sch: schema.Schema, inout ok: i64, inout bad: i64) {
+    let cases = List[
+        "", " ", ";", ";;;", "SELECT", "SELECT 1", "SELECT 99999999999999999999999999999", "SELECT 1e999999999",
+        "SELECT $0", "SELECT $99999999999", "SELECT $1000000", "SELECT $1 FROM users WHERE id = $999",
+        "SELECT '\\", "SELECT E'\\", "SELECT $$", "SELECT $a$ x", "SELECT \"", "SELECT /*", "SELECT --",
+        "SELECT id FROM users WHERE ((((", "SELECT id FROM users WHERE id IN (", "SELECT CASE", "SELECT CASE WHEN",
+        "SELECT id FROM users ORDER BY", "SELECT id FROM users LIMIT", "INSERT INTO", "INSERT INTO users", "INSERT INTO users VALUES",
+        "INSERT INTO users (id) VALUES ()", "UPDATE", "UPDATE users SET", "DELETE", "DELETE FROM", "SELECT é FROM users", "SELECT 'é' || 'ü'",
+        "SELECT \"é\" FROM users", "SELECT * FROM users, users", "SELECT a.b.c.d FROM users", "SELECT id FROM users u, orders u",
+        "SELECT ARRAY[1,2,3]", "SELECT ARRAY[]", "SELECT '{{}}'::int[]", "SELECT 1::nosuchtype", "SELECT count(DISTINCT)", "SELECT count(*)(",
+        "SELECT sum(*)", "SELECT id FROM users WHERE id = ANY(", "SELECT -", "SELECT NOT", "SELECT 1 IS", "SELECT 1 IS NOT", "SELECT 1 BETWEEN",
+        "SELECT 1 NOT", "SELECT 1 AT TIME ZONE", "SELECT interval", "SELECT date 'x'", "SELECT extract(", "SELECT extract(year FROM"
+    ]
+    for c in cases { run(String.from(c), sch.copy(), inout ok, inout bad) }
+    // deep nesting, long text, many parameters, many columns
+    let mut deep = String.from("SELECT ")
+    for i in 0..3000 { deep.push_str("(") }
+    deep.push_str("1")
+    for i in 0..3000 { deep.push_str(")") }
+    run(deep, sch.copy(), inout ok, inout bad)
+    let mut chain = String.from("SELECT 1")
+    for i in 0..5000 { chain.push_str(" + 1") }
+    run(chain, sch.copy(), inout ok, inout bad)
+    let mut nots = String.from("SELECT ")
+    for i in 0..3000 { nots.push_str("NOT ") }
+    nots.push_str("true")
+    run(nots, sch.copy(), inout ok, inout bad)
+    let mut many = String.from("SELECT id FROM users WHERE id IN (")
+    for i in 0..2000 {
+        if i > 0 { many.push_str(", ") }
+        many.push_str("$")
+        many.append(String.from_int((i + 1) as i64))
+    }
+    many.push_str(")")
+    run(many, sch.copy(), inout ok, inout bad)
+    let mut cols = String.from("SELECT ")
+    for i in 0..3000 {
+        if i > 0 { cols.push_str(", ") }
+        cols.push_str("id")
+    }
+    cols.push_str(" FROM users")
+    run(cols, sch.copy(), inout ok, inout bad)
+}
+
+fn ddl_hostile(inout ok: i64, inout bad: i64) {
+    let base = String.from(DDL)
+    let mut i: usize = 0
+    while i <= base.len() {
+        match ddl.apply(schema.empty(), base.slice(0, i)) {
+            Ok(s) => { ok += 1 }
+            Err(e) => { bad += 1 }
+        }
+        i += 7
+    }
+    let mut seed: u64 = 99
+    let chars = "abcxyz();,'\"$ \n-*/".bytes()
+    for round in 0..600 {
+        let mut b = base.bytes()
+        for e in 0..3 {
+            let at = (next(inout seed) % (b.len() as u64)) as usize
+            b[at] = chars[(next(inout seed) % (chars.len() as u64)) as usize]
+        }
+        match String.from_bytes(b) {
+            Ok(t) => {
+                match ddl.apply(schema.empty(), t) {
+                    Ok(s) => { ok += 1 }
+                    Err(e) => { bad += 1 }
+                }
+            }
+            Err(_) => {}
+        }
+    }
+    let nasty = List["CREATE TABLE", "CREATE TABLE t (", "CREATE TABLE t (a", "CREATE TABLE t (a int,", "CREATE TABLE t (a int) INHERITS (", "ALTER TABLE", "ALTER TABLE t", "ALTER", "DROP", "DROP TABLE",
+        "CREATE TABLE t (a int REFERENCES", "CREATE TABLE t (a int DEFAULT (((((((", "CREATE TABLE t (a int, PRIMARY KEY (", "CREATE TABLE t (a int, PRIMARY KEY (zz))", "CREATE INDEX", "CREATE INDEX i ON", "CREATE INDEX i ON t (",
+        "CREATE TYPE", "CREATE TYPE t AS ENUM (", "CREATE TYPE t AS ENUM ('a'", "ALTER TYPE", ")))", "(((", "CREATE TABLE t (a int[][][]);", "CREATE TABLE t (a numeric(1,2,3)", "CREATE TABLE t (a timestamp(", "CREATE TABLE \"\" (a int)"]
+    for n in nasty {
+        match ddl.apply(schema.empty(), String.from(n)) {
+            Ok(s) => { ok += 1 }
+            Err(e) => { bad += 1 }
+        }
+    }
+}
+
+fn files(inout ok: i64, inout bad: i64) {
+    let cases = List["-- name: A :one\nSELECT 1", "-- name: A :one", "-- name:", "-- name: A", "-- name: A :bogus\nSELECT 1;", "SELECT 1;", "-- name: A :one\n-- name: B :one\nSELECT 1;",
+        "-- name: A :many\nSELECT $1, :x;", "-- name: A :many\nSELECT :x, :x, :y;", "-- name: 1A :one\nSELECT 1;", "-- name: A :one\n;", "-- name: A :one\nSELECT 'unterminated", ";;;", "-- name: A :exec\nDELETE FROM users;\n-- name: A :exec\nDELETE FROM users;"]
+    for c in cases {
+        match queryfile.parse_file(String.from(c)) {
+            Ok(q) => { ok += 1 }
+            Err(e) => { bad += 1 }
+        }
+    }
+}
+
+fn main() uses io {
+    let sch = match ddl.build(List[(String.from("init"), String.from(DDL))]) {
+        Ok(s) => s
+        Err(e) => {
+            print("ddl error: {e.msg}")
+            return
+        }
+    }
+    let mut ok: i64 = 0
+    let mut bad: i64 = 0
+    prefixes(sch.copy(), inout ok, inout bad)
+    print("prefixes: {ok} accepted, {bad} refused")
+    ok = 0
+    bad = 0
+    mutations(sch.copy(), inout ok, inout bad)
+    print("mutations: {ok} accepted, {bad} refused")
+    ok = 0
+    bad = 0
+    soup(sch.copy(), inout ok, inout bad)
+    print("soup: {ok} accepted, {bad} refused")
+    ok = 0
+    bad = 0
+    odd(sch.copy(), inout ok, inout bad)
+    print("odd: {ok} accepted, {bad} refused")
+    ok = 0
+    bad = 0
+    ddl_hostile(inout ok, inout bad)
+    print("ddl: {ok} accepted, {bad} refused")
+    ok = 0
+    bad = 0
+    files(inout ok, inout bad)
+    print("query files: {ok} accepted, {bad} refused")
+    print("never trapped")
+}

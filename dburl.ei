@@ -1,0 +1,124 @@
+//! sql.dburl: `postgres://user:password@host:port/database?sslmode=disable` from a runtime String.
+//!
+//! eider-postgres's `parse_url` takes a `str` (a literal), and Eider has no conversion from a `String` to a
+//! `str`, so a URL read from the environment or a flag cannot go through it. This reads the same shape into a
+//! `postgres.Config`: user, percent-decoded password, host (an IPv6 address in brackets), port, database, and the
+//! query parameters `sslmode` and `application_name`; any other parameter becomes a startup parameter.
+
+import std.strings
+import postgres
+
+fn s(x: str) -> String { String.from(x) }
+
+fn bad(msg: str) -> postgres.Error { postgres.fail(postgres.Usage, msg) }
+
+fn decode(t: String) -> Result[String, postgres.Error] {
+    match postgres.percent_decode(t) {
+        Some(d) => Ok(d)
+        None => Err(bad("the URL has a bad %-escape"))
+    }
+}
+
+pub fn parse(url: String) -> Result[postgres.Config, postgres.Error] {
+    let mut rest = s("")
+    if strings.starts_with(url.copy(), "postgres://") {
+        rest = url.slice(11, url.len())
+    } else if strings.starts_with(url.copy(), "postgresql://") {
+        rest = url.slice(13, url.len())
+    } else {
+        return Err(bad("the URL must start with postgres://"))
+    }
+    let mut cfg = postgres.config("localhost", "", "")
+    // the query
+    let mut query = s("")
+    match strings.split_once(rest.copy(), "?") {
+        Some(pair) => {
+            let (a, b) = pair
+            rest = a
+            query = b
+        }
+        None => {}
+    }
+    // the database
+    let mut hostpart = rest.copy()
+    match strings.split_once(rest.copy(), "/") {
+        Some(pair) => {
+            let (a, b) = pair
+            hostpart = a
+            cfg.database = decode(b)?
+        }
+        None => {}
+    }
+    // user info
+    let mut hp = hostpart.copy()
+    match strings.rfind(hostpart.copy(), "@") {
+        Some(i) => {
+            let info = hostpart.slice(0, i)
+            hp = hostpart.slice(i + 1, hostpart.len())
+            match strings.split_once(info.copy(), ":") {
+                Some(pair) => {
+                    let (u, p) = pair
+                    cfg.user = decode(u)?
+                    cfg.password = Some(decode(p)?)
+                }
+                None => { cfg.user = decode(info)? }
+            }
+        }
+        None => {}
+    }
+    // host and port
+    let mut host = hp.copy()
+    let mut port_text = s("")
+    if hp.len() > 0 && hp.byte(0) == 91 {
+        match strings.find(hp.copy(), "]") {
+            Some(i) => {
+                host = hp.slice(1, i)
+                let after = hp.slice(i + 1, hp.len())
+                if after.len() > 0 && after.byte(0) == 58 { port_text = after.slice(1, after.len()) }
+            }
+            None => { return Err(bad("the URL has an unclosed [ in the host")) }
+        }
+    } else {
+        match strings.split_once(hp.copy(), ":") {
+            Some(pair) => {
+                let (a, b) = pair
+                host = a
+                port_text = b
+            }
+            None => {}
+        }
+    }
+    if host.len() > 0 { cfg.host = host }
+    if port_text.len() > 0 {
+        match strings.parse_i32(port_text) {
+            Ok(p) => { cfg.port = p }
+            Err(e) => { return Err(bad("the URL has a bad port")) }
+        }
+    }
+    if cfg.user.len() == 0 { return Err(bad("the URL has no user")) }
+    if cfg.database.len() == 0 { cfg.database = cfg.user.copy() }
+    // parameters
+    if query.len() > 0 {
+        for kv in strings.split(query, "&") {
+            if kv.len() == 0 { continue }
+            let mut k = kv.copy()
+            let mut v = s("")
+            match strings.split_once(kv.copy(), "=") {
+                Some(pair) => {
+                    let (a, b) = pair
+                    k = a
+                    v = decode(b)?
+                }
+                None => {}
+            }
+            if k == s("sslmode") {
+                if v == s("disable") { cfg.sslmode = postgres.Disable } else if v == s("prefer") { cfg.sslmode = postgres.Prefer } else if v == s("require") { cfg.sslmode = postgres.Require } else if v == s("verify-ca") { cfg.sslmode = postgres.VerifyCa } else if v == s("verify-full") { cfg.sslmode = postgres.VerifyFull } else { return Err(bad("the URL has an unknown sslmode")) }
+            } else if k == s("application_name") {
+                cfg.application_name = v
+            } else {
+                cfg.params.push((k, v))
+            }
+        }
+    }
+    Ok(cfg)
+}

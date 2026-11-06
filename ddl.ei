@@ -1,0 +1,815 @@
+//! sql.ddl: reads the DDL of migrations and builds the schema model (`sql.schema`), with no database.
+//!
+//! `apply(schema, text)` runs the statements of one migration against the schema, in order:
+//! CREATE TABLE, ALTER TABLE (ADD/DROP COLUMN, ALTER COLUMN SET/DROP NOT NULL / TYPE / DEFAULT,
+//! ADD/DROP CONSTRAINT, RENAME), DROP TABLE, CREATE/DROP INDEX, CREATE/ALTER/DROP TYPE (enums).
+//! Statements that do not change what a query can read (INSERT, GRANT, COMMENT, SET, CREATE EXTENSION,
+//! functions, triggers, ...) are skipped; the ones that might (views, `CREATE TABLE ... AS`, partitions)
+//! are skipped with a note in `Schema.notes`, so a query on what they would have made says why the
+//! checker does not know it. A statement it cannot read is an error with the position.
+
+import sql
+import sql.cursor
+import sql.lex
+import sql.schema
+
+/// Runs the statements of `text` against `s` and returns the new schema.
+pub fn apply(s: schema.Schema, text: String) -> Result[schema.Schema, sql.Error] {
+    let toks = lex.lex(text)?
+    let mut out = s.copy()
+    let mut i: usize = 0
+    let n = toks.len()
+    while i < n {
+        let mut stmt: List[lex.Tok] = List.new()
+        while i < n && toks[i].kind != lex.T_EOF && !(toks[i].kind == lex.T_OP && toks[i].text == String.from(";")) {
+            stmt.push(toks[i])
+            i += 1
+        }
+        let endpos = if i < n { toks[i].pos } else { text.len() }
+        i += 1
+        if stmt.len() > 0 {
+            stmt.push(lex.Tok(lex.T_EOF, String.from(""), endpos, endpos))
+            statement(inout out, stmt)?
+        }
+    }
+    Ok(out)
+}
+
+/// Runs every `(name, text)` migration in order against an empty schema. The error names the
+/// migration.
+pub fn build(migrations: List[(String, String)]) -> Result[schema.Schema, sql.Error] {
+    let mut s = schema.empty()
+    for m in migrations {
+        let (name, text) = m
+        match apply(s.copy(), text.copy()) {
+            Ok(next) => { s = next }
+            Err(e) => {
+                let mut msg = name.copy()
+                msg.push_str(": ")
+                msg.append(e.msg)
+                // the caller formats the position against the text of this migration
+                return Err(sql.error(msg, e.pos))
+            }
+        }
+    }
+    Ok(s)
+}
+
+fn note(inout s: schema.Schema, what: String) {
+    if s.notes.len() < 100 { s.notes.push(what) }
+}
+
+fn first_words(c: cursor.Cur, n: usize) -> String {
+    let mut out = String.from("")
+    let mut k: usize = 0
+    while k < n {
+        let t = cursor.peek_at(c, k)
+        if t.kind == lex.T_EOF { break }
+        if k > 0 { out.push_str(" ") }
+        out.append(t.text.copy())
+        k += 1
+    }
+    out
+}
+
+fn statement(inout s: schema.Schema, toks: List[lex.Tok]) -> Result[(), sql.Error] {
+    let mut c = cursor.new(toks)
+    let w = cursor.peek(c)
+    if w.kind != lex.T_WORD { return Err(cursor.fail(c, String.from("expected a statement"))) }
+    if cursor.eat_word(inout c, "create") {
+        // modifiers that do not matter here
+        let mut skipping = true
+        while skipping {
+            if cursor.eat_word(inout c, "temporary") || cursor.eat_word(inout c, "temp") || cursor.eat_word(inout c, "unlogged") || cursor.eat_word(inout c, "global") || cursor.eat_word(inout c, "local") {
+                skipping = true
+            } else if cursor.is_word(c, "or") && cursor.is_word_at(c, 1, "replace") {
+                cursor.bump(inout c)
+                cursor.bump(inout c)
+            } else {
+                skipping = false
+            }
+        }
+        let unique = cursor.eat_word(inout c, "unique")
+        if cursor.eat_word(inout c, "table") { return create_table(inout s, inout c) }
+        if cursor.eat_word(inout c, "index") { return create_index(inout s, inout c, unique) }
+        if cursor.eat_word(inout c, "type") { return create_type(inout s, inout c) }
+        let kind = first_words(c, 2)
+        if cursor.is_word(c, "view") || cursor.is_word(c, "materialized") || cursor.is_word(c, "foreign") || cursor.is_word(c, "sequence") {
+            let mut m = String.from("skipped CREATE ")
+            m.append(kind)
+            note(inout s, m)
+        }
+        return Ok(())
+    }
+    if cursor.eat_word(inout c, "alter") {
+        if cursor.eat_word(inout c, "table") { return alter_table(inout s, inout c) }
+        if cursor.eat_word(inout c, "type") { return alter_type(inout s, inout c) }
+        return Ok(())
+    }
+    if cursor.eat_word(inout c, "drop") {
+        if cursor.eat_word(inout c, "table") { return drop_table(inout s, inout c) }
+        if cursor.eat_word(inout c, "index") { return drop_index(inout s, inout c) }
+        if cursor.eat_word(inout c, "type") { return drop_type(inout s, inout c) }
+        return Ok(())
+    }
+    // data changes, privileges, settings, transactions, comments, ...: nothing to model
+    Ok(())
+}
+
+// ----------------------------------------------------------------------------- types
+
+pub type ParsedType = { ty: String, array: bool, serial: bool }
+
+fn type_error(c: cursor.Cur, what: String) -> sql.Error { cursor.fail(c, what) }
+
+/// Reads a type name: `int8`, `character varying(20)`, `timestamp(3) with time zone`, `text[]`,
+/// `public.mood`, `numeric(10, 2)[]`.
+pub fn parse_type(inout c: cursor.Cur, s: schema.Schema) -> Result[ParsedType, sql.Error] {
+    let t = cursor.peek(c)
+    if t.kind != lex.T_WORD && t.kind != lex.T_QUOTED {
+        return Err(type_error(c, String.from("expected a type")))
+    }
+    cursor.bump(inout c)
+    let mut name = t.text.copy()
+    let quoted = t.kind == lex.T_QUOTED
+    // qualified: keep the last part
+    while cursor.is_op(c, ".") {
+        cursor.bump(inout c)
+        name = cursor.any_name(inout c)?
+    }
+    if !quoted {
+        if name == String.from("double") {
+            cursor.expect_word(inout c, "precision")?
+            name = String.from("double precision")
+        } else if name == String.from("character") || name == String.from("char") || name == String.from("bit") || name == String.from("national") {
+            if cursor.eat_word(inout c, "varying") {
+                if name == String.from("bit") { name = String.from("bit varying") } else { name = String.from("character varying") }
+            }
+        } else if name == String.from("timestamp") || name == String.from("time") {
+            if cursor.is_op(c, "(") { cursor.skip_parens(inout c)? }
+            if cursor.eat_word(inout c, "with") {
+                cursor.expect_word(inout c, "time")?
+                cursor.expect_word(inout c, "zone")?
+                name.push_str(" with time zone")
+            } else if cursor.eat_word(inout c, "without") {
+                cursor.expect_word(inout c, "time")?
+                cursor.expect_word(inout c, "zone")?
+                name.push_str(" without time zone")
+            }
+        }
+    }
+    if cursor.is_op(c, "(") { cursor.skip_parens(inout c)? }
+    let mut array = false
+    while cursor.is_op(c, "[") {
+        cursor.bump(inout c)
+        if cursor.peek(c).kind == lex.T_NUM { cursor.bump(inout c) }
+        cursor.expect_op(inout c, "]")?
+        array = true
+    }
+    if cursor.eat_word(inout c, "array") {
+        array = true
+        if cursor.is_op(c, "[") {
+            cursor.bump(inout c)
+            if cursor.peek(c).kind == lex.T_NUM { cursor.bump(inout c) }
+            cursor.expect_op(inout c, "]")?
+        }
+    }
+    let serial = name == String.from("serial") || name == String.from("bigserial") || name == String.from("smallserial") || name == String.from("serial2") || name == String.from("serial4") || name == String.from("serial8")
+    match schema.canonical(name.copy()) {
+        Some(canon) => Ok(ParsedType(canon, array, serial))
+        None => Ok(ParsedType(name, array, false))
+    }
+}
+
+/// Whether the checker can read a column of this type: a builtin or a known enum.
+pub fn known_type(s: schema.Schema, ty: String) -> bool {
+    if schema.is_builtin(ty.copy()) { return true }
+    schema.find_enum(s, ty).is_some()
+}
+
+// ----------------------------------------------------------------------------- CREATE TABLE
+
+fn constraint_start(c: cursor.Cur) -> bool {
+    cursor.is_word(c, "constraint") || cursor.is_word(c, "primary") || cursor.is_word(c, "unique") || cursor.is_word(c, "foreign") || cursor.is_word(c, "check") || cursor.is_word(c, "exclude")
+}
+
+fn create_table(inout s: schema.Schema, inout c: cursor.Cur) -> Result[(), sql.Error] {
+    if cursor.is_word(c, "if") && cursor.is_word_at(c, 1, "not") && cursor.is_word_at(c, 2, "exists") {
+        cursor.bump(inout c)
+        cursor.bump(inout c)
+        cursor.bump(inout c)
+    }
+    let start = cursor.pos(c)
+    let name = cursor.qname(inout c)?
+    if cursor.is_word(c, "as") || cursor.is_word(c, "partition") {
+        let mut m = String.from("skipped CREATE TABLE ")
+        m.append(name.copy())
+        m.push_str(" (AS or PARTITION OF): the checker does not know its columns")
+        note(inout s, m)
+        return Ok(())
+    }
+    cursor.expect_op(inout c, "(")?
+    let mut t = schema.Table(name.copy(), List.new(), List.new(), List.new(), List.new())
+    let mut pending_pk: List[String] = List.new()
+    if cursor.is_op(c, ")") {
+        cursor.bump(inout c)
+    } else {
+        let mut more = true
+        while more {
+            if cursor.is_word(c, "like") {
+                let mut m = String.from("skipped CREATE TABLE ")
+                m.append(name.copy())
+                m.push_str(" (LIKE): the checker does not know its columns")
+                note(inout s, m)
+                return Ok(())
+            }
+            if constraint_start(c) {
+                table_constraint(inout t, inout pending_pk, inout c)?
+            } else {
+                column_def(inout t, s, inout c)?
+            }
+            if cursor.eat_op(inout c, ",") {
+                more = true
+            } else {
+                more = false
+            }
+        }
+        cursor.expect_op(inout c, ")")?
+    }
+    // INHERITS, PARTITION BY, WITH, TABLESPACE, ON COMMIT: nothing for the checker
+    let mut seen: List[String] = List.new()
+    for col in t.columns {
+        if seen.contains(col.name) {
+            let mut m = String.from("column \"")
+            m.append(col.name.copy())
+            m.push_str("\" specified more than once")
+            return Err(sql.error(m, start))
+        }
+        seen.push(col.name.copy())
+    }
+    if pending_pk.len() > 0 { set_pk(inout t, pending_pk, start)? }
+    if schema.find_table(s, name.copy()).is_some() {
+        let mut m = String.from("table \"")
+        m.append(name)
+        m.push_str("\" already exists")
+        return Err(sql.error(m, start))
+    }
+    s.tables.push(t)
+    Ok(())
+}
+
+fn set_pk(inout t: schema.Table, cols: List[String], at: usize) -> Result[(), sql.Error] {
+    for cn in cols {
+        match schema.find_column(t, cn.copy()) {
+            Some(j) => {
+                t.columns[j].pk = true
+                t.columns[j].not_null = true
+            }
+            None => {
+                let mut m = String.from("column \"")
+                m.append(cn)
+                m.push_str("\" named in the primary key does not exist")
+                return Err(sql.error(m, at))
+            }
+        }
+    }
+    t.pk = cols
+    Ok(())
+}
+
+fn column_def(inout t: schema.Table, s: schema.Schema, inout c: cursor.Cur) -> Result[(), sql.Error] {
+    let at = cursor.pos(c)
+    let name = cursor.any_name(inout c)?
+    let pt = parse_type(inout c, s.copy())?
+    let mut col = schema.column(name.copy(), pt.ty.copy(), pt.array)
+    if pt.serial {
+        col.not_null = true
+        col.has_default = true
+    }
+    if !known_type(s.copy(), pt.ty.copy()) {
+        // kept: a query that reads this column says so
+        col.ty = pt.ty.copy()
+    }
+    column_constraints(inout t, inout col, inout c)?
+    if col.pk && t.pk.len() == 0 { t.pk = List[col.name.copy()] }
+    t.columns.push(col)
+    Ok(())
+}
+
+
+fn column_constraints(inout t: schema.Table, inout col: schema.Column, inout c: cursor.Cur) -> Result[(), sql.Error] {
+    let stops = List["not", "null", "primary", "unique", "references", "check", "constraint", "generated", "collate", "default"]
+    let mut go = true
+    while go {
+        if cursor.eat_word(inout c, "constraint") {
+            let nm = cursor.any_name(inout c)?
+        } else if cursor.is_word(c, "not") && cursor.is_word_at(c, 1, "null") {
+            cursor.bump(inout c)
+            cursor.bump(inout c)
+            col.not_null = true
+        } else if cursor.eat_word(inout c, "null") {
+            col.not_null = col.pk
+        } else if cursor.eat_word(inout c, "default") {
+            col.has_default = true
+            cursor.skip_item(inout c, stops)?
+        } else if cursor.is_word(c, "primary") {
+            cursor.bump(inout c)
+            cursor.expect_word(inout c, "key")?
+            col.pk = true
+            col.not_null = true
+        } else if cursor.eat_word(inout c, "unique") {
+            t.uniques.push(List[col.name.copy()])
+        } else if cursor.eat_word(inout c, "references") {
+            let rt = cursor.qname(inout c)?
+            let mut refs: List[String] = List.new()
+            if cursor.is_op(c, "(") { refs = cursor.name_list(inout c)? }
+            t.fks.push(schema.ForeignKey(List[col.name.copy()], rt, refs))
+            fk_actions(inout c)?
+        } else if cursor.eat_word(inout c, "check") {
+            cursor.skip_parens(inout c)?
+            if cursor.is_word(c, "no") && cursor.is_word_at(c, 1, "inherit") {
+                cursor.bump(inout c)
+                cursor.bump(inout c)
+            }
+        } else if cursor.eat_word(inout c, "generated") {
+            if cursor.eat_word(inout c, "always") {
+                // GENERATED ALWAYS AS IDENTITY, or AS (expr) STORED
+            } else {
+                cursor.expect_word(inout c, "by")?
+                cursor.expect_word(inout c, "default")?
+            }
+            cursor.expect_word(inout c, "as")?
+            if cursor.eat_word(inout c, "identity") {
+                if cursor.is_op(c, "(") { cursor.skip_parens(inout c)? }
+                col.not_null = true
+            } else {
+                cursor.skip_parens(inout c)?
+                cursor.expect_word(inout c, "stored")?
+            }
+            col.has_default = true
+        } else if cursor.eat_word(inout c, "collate") {
+            let cn = cursor.qname(inout c)?
+        } else if cursor.eat_word(inout c, "deferrable") || cursor.eat_word(inout c, "initially") {
+            cursor.skip_item(inout c, stops)?
+        } else {
+            go = false
+        }
+    }
+    Ok(())
+}
+
+/// `ON DELETE|UPDATE action`, `MATCH x`, `[NOT] DEFERRABLE`, `INITIALLY x` after REFERENCES.
+fn fk_actions(inout c: cursor.Cur) -> Result[(), sql.Error] {
+    let mut go = true
+    while go {
+        if cursor.eat_word(inout c, "on") {
+            if !cursor.eat_word(inout c, "delete") { cursor.expect_word(inout c, "update")? }
+            if cursor.eat_word(inout c, "no") {
+                cursor.expect_word(inout c, "action")?
+            } else if cursor.eat_word(inout c, "set") {
+                if !cursor.eat_word(inout c, "null") { cursor.expect_word(inout c, "default")? }
+                if cursor.is_op(c, "(") { cursor.skip_parens(inout c)? }
+            } else if !(cursor.eat_word(inout c, "cascade") || cursor.eat_word(inout c, "restrict")) {
+                return Err(cursor.fail(c, String.from("expected a referential action")))
+            }
+        } else if cursor.eat_word(inout c, "match") {
+            let m = cursor.any_name(inout c)?
+        } else if cursor.is_word(c, "not") && cursor.is_word_at(c, 1, "deferrable") {
+            cursor.bump(inout c)
+            cursor.bump(inout c)
+        } else if cursor.eat_word(inout c, "deferrable") {
+            go = true
+        } else if cursor.eat_word(inout c, "initially") {
+            let m = cursor.any_name(inout c)?
+        } else {
+            go = false
+        }
+    }
+    Ok(())
+}
+
+fn table_constraint(inout t: schema.Table, inout pending_pk: List[String], inout c: cursor.Cur) -> Result[(), sql.Error] {
+    if cursor.eat_word(inout c, "constraint") {
+        let cn = cursor.any_name(inout c)?
+    }
+    if cursor.eat_word(inout c, "primary") {
+        cursor.expect_word(inout c, "key")?
+        pending_pk = cursor.name_list(inout c)?
+        skip_index_params(inout c)?
+    } else if cursor.eat_word(inout c, "unique") {
+        if cursor.is_word(c, "nulls") {
+            cursor.bump(inout c)
+            cursor.expect_word(inout c, "not")?
+            cursor.expect_word(inout c, "distinct")?
+        }
+        t.uniques.push(cursor.name_list(inout c)?)
+        skip_index_params(inout c)?
+    } else if cursor.eat_word(inout c, "foreign") {
+        cursor.expect_word(inout c, "key")?
+        let cols = cursor.name_list(inout c)?
+        cursor.expect_word(inout c, "references")?
+        let rt = cursor.qname(inout c)?
+        let mut refs: List[String] = List.new()
+        if cursor.is_op(c, "(") { refs = cursor.name_list(inout c)? }
+        t.fks.push(schema.ForeignKey(cols, rt, refs))
+        fk_actions(inout c)?
+    } else if cursor.eat_word(inout c, "check") {
+        cursor.skip_parens(inout c)?
+        if cursor.is_word(c, "no") && cursor.is_word_at(c, 1, "inherit") {
+            cursor.bump(inout c)
+            cursor.bump(inout c)
+        }
+    } else if cursor.eat_word(inout c, "exclude") {
+        cursor.skip_item(inout c, List.new())?
+    } else {
+        return Err(cursor.fail(c, String.from("expected a table constraint")))
+    }
+    Ok(())
+}
+
+/// `INCLUDE (...)`, `WITH (...)`, `USING INDEX TABLESPACE x`, `DEFERRABLE ...` after a key.
+fn skip_index_params(inout c: cursor.Cur) -> Result[(), sql.Error] {
+    let mut go = true
+    while go {
+        if cursor.eat_word(inout c, "include") || cursor.eat_word(inout c, "with") {
+            cursor.skip_parens(inout c)?
+        } else if cursor.eat_word(inout c, "using") {
+            cursor.expect_word(inout c, "index")?
+            cursor.expect_word(inout c, "tablespace")?
+            let n = cursor.any_name(inout c)?
+        } else if cursor.is_word(c, "not") && cursor.is_word_at(c, 1, "deferrable") {
+            cursor.bump(inout c)
+            cursor.bump(inout c)
+        } else if cursor.eat_word(inout c, "deferrable") {
+            go = true
+        } else if cursor.eat_word(inout c, "initially") {
+            let m = cursor.any_name(inout c)?
+        } else {
+            go = false
+        }
+    }
+    Ok(())
+}
+
+// ----------------------------------------------------------------------------- ALTER TABLE
+
+fn no_table(name: String, at: usize) -> sql.Error {
+    let mut m = String.from("relation \"")
+    m.append(name)
+    m.push_str("\" does not exist")
+    sql.error(m, at)
+}
+
+fn no_column(table: String, name: String, at: usize) -> sql.Error {
+    let mut m = String.from("column \"")
+    m.append(name)
+    m.push_str("\" of relation \"")
+    m.append(table)
+    m.push_str("\" does not exist")
+    sql.error(m, at)
+}
+
+fn if_exists(inout c: cursor.Cur) -> bool {
+    if cursor.is_word(c, "if") && cursor.is_word_at(c, 1, "exists") {
+        cursor.bump(inout c)
+        cursor.bump(inout c)
+        return true
+    }
+    false
+}
+
+fn alter_table(inout s: schema.Schema, inout c: cursor.Cur) -> Result[(), sql.Error] {
+    let missing_ok = if_exists(inout c)
+    cursor.eat_word(inout c, "only")
+    let at = cursor.pos(c)
+    let name = cursor.qname(inout c)?
+    cursor.eat_op(inout c, "*")
+    let ti = match schema.find_table(s.copy(), name.copy()) {
+        Some(i) => i
+        None => {
+            if missing_ok { return Ok(()) }
+            return Err(no_table(name, at))
+        }
+    }
+    let mut t = s.tables[ti].copy()
+    let mut renamed_to: Option[String] = None
+    let mut more = true
+    while more {
+        let a = cursor.pos(c)
+        if cursor.eat_word(inout c, "add") {
+            if constraint_start(c) {
+                let mut pk: List[String] = List.new()
+                table_constraint(inout t, inout pk, inout c)?
+                if pk.len() > 0 { set_pk(inout t, pk, a)? }
+            } else {
+                cursor.eat_word(inout c, "column")
+                let mut skip_if_exists = false
+                if cursor.is_word(c, "if") && cursor.is_word_at(c, 1, "not") && cursor.is_word_at(c, 2, "exists") {
+                    cursor.bump(inout c)
+                    cursor.bump(inout c)
+                    cursor.bump(inout c)
+                    skip_if_exists = true
+                }
+                let before = t.columns.len()
+                let mut extra = schema.Table(t.name.copy(), List.new(), List.new(), List.new(), List.new())
+                column_def(inout extra, s.copy(), inout c)?
+                let col = extra.columns[0].copy()
+                match schema.find_column(t, col.name.copy()) {
+                    Some(j) => {
+                        if !skip_if_exists {
+                            let mut m = String.from("column \"")
+                            m.append(col.name.copy())
+                            m.push_str("\" of relation \"")
+                            m.append(t.name.copy())
+                            m.push_str("\" already exists")
+                            return Err(sql.error(m, a))
+                        }
+                    }
+                    None => {
+                        if col.pk { t.pk = List[col.name.copy()] }
+                        for u in extra.uniques { t.uniques.push(u) }
+                        for f in extra.fks { t.fks.push(f) }
+                        t.columns.push(col)
+                    }
+                }
+            }
+        } else if cursor.eat_word(inout c, "drop") {
+            if cursor.eat_word(inout c, "constraint") {
+                let ie = if_exists(inout c)
+                let cn = cursor.any_name(inout c)?
+                if strings_ends_with(cn.copy(), "_pkey") {
+                    for j in 0..t.columns.len() { t.columns[j].pk = false }
+                    t.pk = List.new()
+                }
+            } else {
+                cursor.eat_word(inout c, "column")
+                let ie = if_exists(inout c)
+                let cn = cursor.any_name(inout c)?
+                match schema.find_column(t, cn.copy()) {
+                    Some(j) => {
+                        t.columns.remove(j)
+                        let mut keep: List[String] = List.new()
+                        for p in t.pk { if p != cn { keep.push(p) } }
+                        t.pk = keep
+                    }
+                    None => {
+                        if !ie { return Err(no_column(t.name.copy(), cn, a)) }
+                    }
+                }
+            }
+            if cursor.eat_word(inout c, "cascade") || cursor.eat_word(inout c, "restrict") {
+                more = true
+            }
+        } else if cursor.eat_word(inout c, "alter") {
+            cursor.eat_word(inout c, "column")
+            let ca = cursor.pos(c)
+            let cn = cursor.any_name(inout c)?
+            let j = match schema.find_column(t, cn.copy()) {
+                Some(j) => j
+                None => { return Err(no_column(t.name.copy(), cn, ca)) }
+            }
+            if cursor.is_word(c, "set") && cursor.is_word_at(c, 1, "not") && cursor.is_word_at(c, 2, "null") {
+                cursor.bump(inout c)
+                cursor.bump(inout c)
+                cursor.bump(inout c)
+                t.columns[j].not_null = true
+            } else if cursor.is_word(c, "drop") && cursor.is_word_at(c, 1, "not") && cursor.is_word_at(c, 2, "null") {
+                cursor.bump(inout c)
+                cursor.bump(inout c)
+                cursor.bump(inout c)
+                t.columns[j].not_null = t.columns[j].pk
+            } else if cursor.is_word(c, "set") && cursor.is_word_at(c, 1, "default") {
+                cursor.bump(inout c)
+                cursor.bump(inout c)
+                t.columns[j].has_default = true
+                cursor.skip_item(inout c, List.new())?
+            } else if cursor.is_word(c, "drop") && cursor.is_word_at(c, 1, "default") {
+                cursor.bump(inout c)
+                cursor.bump(inout c)
+                t.columns[j].has_default = false
+            } else if cursor.is_word(c, "type") || (cursor.is_word(c, "set") && cursor.is_word_at(c, 1, "data") && cursor.is_word_at(c, 2, "type")) {
+                if cursor.eat_word(inout c, "set") {
+                    cursor.bump(inout c)
+                }
+                cursor.bump(inout c)
+                let pt = parse_type(inout c, s.copy())?
+                t.columns[j].ty = pt.ty
+                t.columns[j].array = pt.array
+                cursor.skip_item(inout c, List.new())?
+            } else {
+                // SET STATISTICS, SET STORAGE, ADD GENERATED, DROP IDENTITY, ...
+                cursor.skip_item(inout c, List.new())?
+            }
+        } else if cursor.eat_word(inout c, "rename") {
+            if cursor.eat_word(inout c, "to") {
+                renamed_to = Some(cursor.name(inout c)?)
+            } else if cursor.eat_word(inout c, "constraint") {
+                let o = cursor.any_name(inout c)?
+                cursor.expect_word(inout c, "to")?
+                let nw = cursor.any_name(inout c)?
+            } else {
+                cursor.eat_word(inout c, "column")
+                let ca = cursor.pos(c)
+                let o = cursor.any_name(inout c)?
+                cursor.expect_word(inout c, "to")?
+                let nw = cursor.any_name(inout c)?
+                match schema.find_column(t, o.copy()) {
+                    Some(j) => {
+                        t.columns[j].name = nw.copy()
+                        let mut np: List[String] = List.new()
+                        for p in t.pk { if p == o { np.push(nw.copy()) } else { np.push(p) } }
+                        t.pk = np
+                    }
+                    None => { return Err(no_column(t.name.copy(), o, ca)) }
+                }
+            }
+        } else {
+            // OWNER TO, ENABLE ROW LEVEL SECURITY, SET (...), VALIDATE CONSTRAINT, ...
+            if cursor.at_end(c) { return Err(cursor.fail(c, String.from("expected an ALTER TABLE action"))) }
+            cursor.skip_item(inout c, List.new())?
+            if cursor.pos(c) == a { cursor.bump(inout c) }
+        }
+        more = cursor.eat_op(inout c, ",")
+    }
+    if !cursor.at_end(c) { return Err(cursor.fail(c, String.from("unexpected text after the ALTER TABLE action"))) }
+    match renamed_to {
+        Some(nn) => {
+            if schema.find_table(s.copy(), nn.copy()).is_some() {
+                let mut m = String.from("relation \"")
+                m.append(nn)
+                m.push_str("\" already exists")
+                return Err(sql.error(m, at))
+            }
+            t.name = nn
+        }
+        None => {}
+    }
+    s.tables[ti] = t
+    Ok(())
+}
+
+fn strings_ends_with(s: String, suffix: str) -> bool {
+    let sf = String.from(suffix)
+    if sf.len() > s.len() { return false }
+    s.slice(s.len() - sf.len(), s.len()) == sf
+}
+
+// ----------------------------------------------------------------------------- DROP
+
+fn drop_table(inout s: schema.Schema, inout c: cursor.Cur) -> Result[(), sql.Error] {
+    let ie = if_exists(inout c)
+    let mut more = true
+    while more {
+        let at = cursor.pos(c)
+        let name = cursor.qname(inout c)?
+        match schema.find_table(s.copy(), name.copy()) {
+            Some(i) => {
+                s.tables.remove(i)
+                let mut keep: List[schema.Index] = List.new()
+                for ix in s.indexes { if ix.table != name { keep.push(ix) } }
+                s.indexes = keep
+            }
+            None => {
+                if !ie { return Err(no_table(name, at)) }
+            }
+        }
+        more = cursor.eat_op(inout c, ",")
+    }
+    Ok(())
+}
+
+fn drop_index(inout s: schema.Schema, inout c: cursor.Cur) -> Result[(), sql.Error] {
+    cursor.eat_word(inout c, "concurrently")
+    let ie = if_exists(inout c)
+    let mut more = true
+    while more {
+        let name = cursor.qname(inout c)?
+        let mut keep: List[schema.Index] = List.new()
+        let mut found = false
+        for ix in s.indexes {
+            if ix.name == name { found = true } else { keep.push(ix) }
+        }
+        s.indexes = keep
+        if !found && !ie {
+            // an index made by a constraint (a key, a UNIQUE) is not recorded by name
+            let mut m = String.from("index \"")
+            m.append(name)
+            m.push_str("\" does not exist")
+            let nm = m.copy()
+            note(inout s, nm)
+        }
+        more = cursor.eat_op(inout c, ",")
+    }
+    Ok(())
+}
+
+fn create_index(inout s: schema.Schema, inout c: cursor.Cur, unique: bool) -> Result[(), sql.Error] {
+    cursor.eat_word(inout c, "concurrently")
+    if cursor.is_word(c, "if") && cursor.is_word_at(c, 1, "not") && cursor.is_word_at(c, 2, "exists") {
+        cursor.bump(inout c)
+        cursor.bump(inout c)
+        cursor.bump(inout c)
+    }
+    let mut name = String.from("")
+    if !cursor.is_word(c, "on") { name = cursor.qname(inout c)? }
+    cursor.expect_word(inout c, "on")?
+    cursor.eat_word(inout c, "only")
+    let at = cursor.pos(c)
+    let tn = cursor.qname(inout c)?
+    let ti = match schema.find_table(s.copy(), tn.copy()) {
+        Some(i) => i
+        None => { return Err(no_table(tn, at)) }
+    }
+    if cursor.eat_word(inout c, "using") { let m = cursor.any_name(inout c)? }
+    cursor.expect_op(inout c, "(")?
+    // plain column items must exist; expressions are not looked into
+    let mut more = true
+    while more {
+        let t = cursor.peek(c)
+        if (t.kind == lex.T_WORD || t.kind == lex.T_QUOTED) && !cursor.is_op_at(c, 1, "(") && !(t.kind == lex.T_WORD && cursor.reserved(t.text.copy())) {
+            let nx = cursor.peek_at(c, 1)
+            let plain = nx.kind == lex.T_EOF || (nx.kind == lex.T_OP && (nx.text == String.from(",") || nx.text == String.from(")"))) || (nx.kind == lex.T_WORD && (nx.text == String.from("asc") || nx.text == String.from("desc") || nx.text == String.from("nulls")))
+            if plain && schema.find_column(s.tables[ti], t.text.copy()).is_none() {
+                return Err(no_column(tn.copy(), t.text.copy(), t.pos))
+            }
+        }
+        cursor.skip_item(inout c, List.new())?
+        more = cursor.eat_op(inout c, ",")
+    }
+    cursor.expect_op(inout c, ")")?
+    if name.len() > 0 { s.indexes.push(schema.Index(name, tn, unique)) }
+    Ok(())
+}
+
+// ----------------------------------------------------------------------------- enums
+
+fn create_type(inout s: schema.Schema, inout c: cursor.Cur) -> Result[(), sql.Error] {
+    let at = cursor.pos(c)
+    let name = cursor.qname(inout c)?
+    if !cursor.eat_word(inout c, "as") {
+        return Ok(())
+    }
+    if !cursor.eat_word(inout c, "enum") {
+        let mut m = String.from("skipped CREATE TYPE ")
+        m.append(name)
+        m.push_str(" (not an enum)")
+        note(inout s, m)
+        return Ok(())
+    }
+    cursor.expect_op(inout c, "(")?
+    let mut labels: List[String] = List.new()
+    if !cursor.is_op(c, ")") {
+        let mut more = true
+        while more {
+            let t = cursor.peek(c)
+            if t.kind != lex.T_STR { return Err(cursor.fail(c, String.from("expected an enum label"))) }
+            cursor.bump(inout c)
+            labels.push(t.text)
+            more = cursor.eat_op(inout c, ",")
+        }
+    }
+    cursor.expect_op(inout c, ")")?
+    if schema.find_enum(s.copy(), name.copy()).is_some() {
+        let mut m = String.from("type \"")
+        m.append(name)
+        m.push_str("\" already exists")
+        return Err(sql.error(m, at))
+    }
+    s.enums.push(schema.EnumType(name, labels))
+    Ok(())
+}
+
+fn alter_type(inout s: schema.Schema, inout c: cursor.Cur) -> Result[(), sql.Error] {
+    let at = cursor.pos(c)
+    let name = cursor.qname(inout c)?
+    let ei = match schema.find_enum(s.copy(), name.copy()) {
+        Some(i) => i
+        None => { return Ok(()) }
+    }
+    if cursor.eat_word(inout c, "add") && cursor.eat_word(inout c, "value") {
+        if cursor.is_word(c, "if") && cursor.is_word_at(c, 1, "not") && cursor.is_word_at(c, 2, "exists") {
+            cursor.bump(inout c)
+            cursor.bump(inout c)
+            cursor.bump(inout c)
+        }
+        let t = cursor.peek(c)
+        if t.kind != lex.T_STR { return Err(cursor.fail(c, String.from("expected an enum label"))) }
+        cursor.bump(inout c)
+        if !s.enums[ei].labels.contains(t.text) { s.enums[ei].labels.push(t.text) }
+    }
+    Ok(())
+}
+
+fn drop_type(inout s: schema.Schema, inout c: cursor.Cur) -> Result[(), sql.Error] {
+    let ie = if_exists(inout c)
+    let mut more = true
+    while more {
+        let name = cursor.qname(inout c)?
+        match schema.find_enum(s.copy(), name.copy()) {
+            Some(i) => { s.enums.remove(i) }
+            None => {}
+        }
+        more = cursor.eat_op(inout c, ",")
+    }
+    Ok(())
+}

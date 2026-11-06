@@ -1,0 +1,140 @@
+SELECT id, email, name FROM users WHERE id = $1
+  => params: $1 int8; columns: id int8; email text; name text?;
+SELECT * FROM users WHERE email = $1 AND age > $2
+  => params: $1 text; $2 int4; columns: id int8; email text; name text?; age int4; score float8?; balance numeric; active bool; created_at timestamptz; born date?; tags text[]; meta jsonb?; mood mood; uid uuid;
+SELECT u.id AS uid, o.total, o.note FROM users u JOIN orders o ON o.user_id = u.id WHERE u.id = $1
+  => params: $1 int8; columns: uid int8; total numeric; note text?;
+SELECT u.id, o.id AS oid, o.total FROM users u LEFT JOIN orders o ON o.user_id = u.id
+  => params: columns: id int8; oid int8?; total numeric?;
+SELECT u.id, o.id FROM orders o RIGHT JOIN users u ON o.user_id = u.id
+  => params: columns: id int8; id int8?;
+SELECT count(*), sum(qty), avg(total), max(note), min(shipped_at) FROM orders
+  => params: columns: count int8; sum int8?; avg numeric?; max text?; min timestamp?;
+SELECT count(*) AS n FROM users WHERE name IS NULL
+  => params: columns: n int8;
+SELECT coalesce(name, 'anon') AS who, upper(email), length(email), age + 1, age * 2.5, score / 2 FROM users
+  => params: columns: who text; upper text; length int4; ?column? int4; ?column? numeric; ?column? float8?;
+SELECT id FROM users WHERE id = ANY($1)
+  => params: $1 int8[]; columns: id int8;
+SELECT id FROM users WHERE id IN ($1, $2, 3)
+  => params: $1 int8; $2 int8; columns: id int8;
+SELECT id FROM users WHERE email LIKE $1 OR name ILIKE $2
+  => params: $1 text; $2 text; columns: id int8;
+SELECT id FROM users WHERE created_at BETWEEN $1 AND $2
+  => params: $1 timestamptz; $2 timestamptz; columns: id int8;
+SELECT id FROM users WHERE born IS NOT NULL ORDER BY born DESC, id LIMIT $1 OFFSET $2
+  => params: $1 int8; $2 int8; columns: id int8;
+SELECT CASE WHEN age > 18 THEN 'adult' ELSE 'minor' END AS kind, CASE WHEN score > 1 THEN score END AS s FROM users
+  => params: columns: kind text; s float8?;
+SELECT id::text, $1::int8 AS x, 1::int4, now() AS ts, current_date, true, NULL AS nothing FROM users
+  => params: $1 int8; columns: id text; x int8; int4 int4; ts timestamptz; current_date date; bool bool; nothing text?;
+SELECT meta->'a' AS j, meta->>'b' AS t, meta @> $1::jsonb AS c FROM users
+  => params: $1 jsonb; columns: j jsonb?; t text?; c bool?;
+SELECT tags, tags[1] AS first, array_length(tags, 1) AS n, mood FROM users WHERE mood = 'happy'
+  => params: columns: tags text[]; first text?; n int4?; mood mood;
+SELECT mood, count(*) FROM users GROUP BY mood HAVING count(*) > $1
+  => params: $1 int8; columns: mood mood; count int8;
+SELECT DISTINCT user_id FROM orders ORDER BY 1
+  => params: columns: user_id int8;
+SELECT created_at - interval '1 day' AS d, created_at - created_at AS e, born - born AS f FROM users
+  => params: columns: d timestamptz; e interval; f int4?;
+SELECT date_trunc('day', created_at) AS day, extract(year FROM born) AS y FROM users
+  => params: columns: day timestamptz; y numeric?;
+SELECT a.id FROM users a, users b WHERE a.id = b.id
+  => params: columns: id int8;
+SELECT 1 AS one, 'x' AS lit, 1.5 AS f, 'a' || 'b' AS ab
+  => params: columns: one int4; lit text; f numeric; ab text;
+INSERT INTO users (email, name, age) VALUES ($1, $2, $3)
+  => params: $1 text; $2 text?; $3 int4; columns:
+INSERT INTO users (email, name) VALUES ($1, $2) RETURNING id, created_at
+  => params: $1 text; $2 text?; columns: id int8; created_at timestamptz;
+INSERT INTO orders (user_id, total, note) VALUES ($1, $2, $3), ($4, $5, NULL) RETURNING *
+  => params: $1 int8; $2 numeric; $3 text?; $4 int8; $5 numeric; columns: id int8; user_id int8; total numeric; note text?; shipped_at timestamp?; qty int2;
+INSERT INTO users (email) VALUES ($1) ON CONFLICT (email) DO NOTHING
+  => params: $1 text; columns:
+INSERT INTO users (email, name) VALUES ($1, $2) ON CONFLICT (email) DO UPDATE SET name = excluded.name, age = users.age + 1 RETURNING id
+  => params: $1 text; $2 text?; columns: id int8;
+UPDATE users SET name = $1, score = $2 WHERE id = $3
+  => params: $1 text?; $2 float8?; $3 int8; columns:
+UPDATE users SET age = age + 1 WHERE email = $1 RETURNING age
+  => params: $1 text; columns: age int4;
+UPDATE orders o SET note = NULL, shipped_at = now() WHERE o.id = $1
+  => params: $1 int8; columns:
+DELETE FROM orders WHERE user_id = $1 AND total > $2
+  => params: $1 int8; $2 numeric; columns:
+DELETE FROM users WHERE id = $1 RETURNING id, email
+  => params: $1 int8; columns: id int8; email text;
+SELECT nope FROM users
+  => error: column "nope" does not exist; did you mean "name"?
+SELECT emial FROM users
+  => error: column "emial" does not exist; did you mean "email"?
+SELECT id FROM usrs
+  => error: relation "usrs" does not exist; did you mean "users"?
+SELECT id FROM users, orders
+  => error: column reference "id" is ambiguous
+SELECT x.id FROM users
+  => error: missing FROM-clause entry for table "x"
+SELECT id FROM users WHERE id = 'abc' AND email = 5
+  => error: operator does not exist: text = int4
+SELECT id FROM users WHERE age = email
+  => error: operator does not exist: int4 = text
+SELECT $1
+  => error: could not determine the type of parameter $1 in the select list; add a cast
+SELECT id FROM users WHERE $1 = $2
+  => error: cannot infer the type of a parameter compared with another untyped value; add a cast
+SELECT id FROM users WHERE id = $1 AND email = $1
+  => error: parameter $1 is used as int8 and as text
+SELECT id FROM users WHERE id = $2
+  => error: could not determine the type of parameter $1: add a cast ($1::type) or use it where a type is known
+INSERT INTO users (name) VALUES ($1)
+  => error: null value in column "email" violates not-null constraint (it has no default and INSERT does not give it)
+INSERT INTO users (email, nope) VALUES ($1, $2)
+  => error: column "nope" of relation "users" does not exist; did you mean "name"?
+INSERT INTO users (email, name) VALUES ($1)
+  => error: INSERT has 1 values but 2 target columns
+INSERT INTO users (email, age) VALUES ($1, 'x')
+  => params: $1 text; columns:
+INSERT INTO users (email, age) VALUES (NULL, 1)
+  => error: null value in column "email" violates not-null constraint
+UPDATE users SET nope = 1
+  => error: column "nope" of relation "users" does not exist; did you mean "name"?
+UPDATE users SET age = 'old'
+  => params: columns:
+SELECT id FROM users WHERE name
+  => error: argument of WHERE must be type boolean, not type text
+SELECT id FROM users LIMIT 'x'
+  => params: columns: id int8;
+SELECT lower(age) FROM users
+  => error: function lower does not accept an argument of type int4
+SELECT nosuchfn(id) FROM users
+  => error: unsupported: the function nosuchfn
+WITH x AS (SELECT 1) SELECT * FROM x
+  => error: unsupported: WITH (common table expressions)
+SELECT id FROM users UNION SELECT id FROM orders
+  => error: unsupported: UNION, INTERSECT and EXCEPT
+SELECT id, (SELECT count(*) FROM orders) FROM users
+  => error: unsupported: a subquery
+SELECT id FROM users WHERE id IN (SELECT user_id FROM orders)
+  => error: unsupported: a subquery in IN
+SELECT id FROM users WHERE EXISTS (SELECT 1)
+  => error: unsupported: EXISTS
+SELECT id FROM (SELECT 1 AS id) t
+  => error: unsupported: a subquery in FROM
+SELECT row_number() OVER (ORDER BY id) FROM users
+  => error: unsupported: window functions (OVER)
+SELECT unnest(tags) FROM users
+  => error: unsupported: the set-returning function unnest
+INSERT INTO users (email) SELECT 'a'
+  => error: unsupported: INSERT ... SELECT
+SELECT * FROM users NATURAL JOIN orders
+  => error: unsupported: NATURAL JOIN
+TRUNCATE users
+  => error: expected SELECT, INSERT, UPDATE or DELETE, found `truncate`
+
+  => error: expected SELECT, INSERT, UPDATE or DELETE, found end of input
+SELECT
+  => error: expected an expression, found end of input
+SELECT 1 +
+  => error: expected an expression, found end of input
+SELECT ((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((1)))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))
+  => error: the statement is nested too deeply

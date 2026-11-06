@@ -1,0 +1,72 @@
+//! sql: checked SQL for Eider (package `sql`).
+//!
+//! The package has two halves. The first needs no capability and no database, so it runs in the
+//! generator, in tests and in a `comptime` constant (docs/design.md): the lexer (`sql.lex`), the
+//! migration DDL reader that builds a schema model (`sql.ddl`, `sql.schema`), the query parser and
+//! checker (`sql.parse`, `sql.check`), the reader of annotated `.sql` files (`sql.queryfile`), the
+//! generator of typed Eider modules (`sql.gen`) and the dynamic query builder (`sql.build`). The second
+//! half talks to PostgreSQL through eider-postgres: the migration runner (`sql.migrate`), the
+//! transaction helpers (`sql.tx`) and the batch loader (`sql.load`).
+//!
+//! This module holds what both halves share: the error type of the checker and the text helpers.
+
+import std.strings
+
+/// Why a piece of SQL was refused, and where: `pos` is a byte offset into the text that was being
+/// read (`NOPOS` when there is none). A message starting with `unsupported:` names SQL that is valid
+/// but outside what the checker analyzes (it never guesses).
+pub type Error = { msg: String, pos: usize }
+
+/// "no position".
+pub const NOPOS: usize = 18446744073709551615
+
+pub const VERSION: str = "0.7.0"
+
+pub fn error(msg: String, pos: usize) -> Error { Error(msg, pos) }
+
+/// `unsupported: <what>` at `pos`.
+pub fn unsupported(what: String, pos: usize) -> Error {
+    let mut m = String.from("unsupported: ")
+    m.append(what)
+    Error(m, pos)
+}
+
+pub fn is_unsupported(e: Error) -> bool { strings.starts_with(e.msg, "unsupported:") }
+
+/// The 1-based line and column of byte offset `pos` in `src`.
+pub fn line_col(src: String, pos: usize) -> (usize, usize) {
+    let mut line: usize = 1
+    let mut col: usize = 1
+    let mut i: usize = 0
+    while i < src.len() && i < pos {
+        if src.byte(i) == 10 {
+            line += 1
+            col = 1
+        } else if (src.byte(i) & 192) != 128 {
+            col += 1
+        }
+        i += 1
+    }
+    (line, col)
+}
+
+/// "file:line:col: message" (or "file: message" when there is no position).
+pub fn format_error(file: String, src: String, e: Error) -> String {
+    let mut out = file.copy()
+    if e.pos != NOPOS {
+        let (l, c) = line_col(src, e.pos)
+        out.push_str(":")
+        out.append(String.from_int(l as i64))
+        out.push_str(":")
+        out.append(String.from_int(c as i64))
+    }
+    out.push_str(": ")
+    out.append(e.msg.copy())
+    out
+}
+
+/// `s` with ASCII letters lowercased.
+pub fn lower(s: String) -> String { strings.to_lower(s) }
+
+/// `a == b` where `b` is a literal.
+pub fn is(a: String, b: str) -> bool { a == String.from(b) }

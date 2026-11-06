@@ -1,0 +1,12 @@
+// A query that does not fit the schema breaks the build: the constant below fails to evaluate (E0807) and the
+// message lists the problem with the position in the query file. scripts/test.sh checks the message.
+
+import sql.compiletime as sqlc
+
+const CHECKED: i32 = comptime sqlc.check_all(
+    List[embed("data/schema.sql")],
+    List[embed("data/queries.sql")])
+
+fn main() uses io {
+    print("not reached: {CHECKED}")
+}

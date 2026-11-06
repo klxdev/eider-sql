@@ -1,0 +1,128 @@
+//! sql.compiletime: the checker as a compile-time check. The build fails when a query does not fit the schema.
+//!
+//! ```
+//! import sql.compiletime as sqlc
+//!
+//! const CHECKED: i32 = comptime sqlc.check_all(
+//!     List[embed("migrations/001_users.sql"), embed("migrations/002_orders.sql")],
+//!     List[embed("queries/users.sql")])
+//! ```
+//!
+//! `embed` reads the files when the program is compiled (a path inside the package, a string literal;
+//! eider-lang docs/site/reference/comptime.md), `check_all` runs the same checker `eider-sql check` uses, in the
+//! compiler's interpreter, and a problem is a trap with the message `file:line:col: problem`, which the compiler
+//! reports as an error of the constant (E0807). The value is the number of queries checked. There is no
+//! database. Needs: every migration named in the list (there is no `embed` of a directory), and the parsed schema
+//! is recomputed by each constant that uses it (a `comptime` constant cannot be a record).
+
+import sql
+import sql.check
+import sql.ddl
+import sql.queryfile
+import sql.schema
+
+fn s(x: str) -> String { String.from(x) }
+
+fn label(prefix: str, i: usize) -> String {
+    let mut l = s(prefix)
+    l.append(String.from_int((i + 1) as i64))
+    l
+}
+
+/// The schema after the migrations, or the first problem as text.
+pub fn schema_of(migrations: List[str]) -> Result[schema.Schema, String] {
+    let mut sch = schema.empty()
+    let mut i: usize = 0
+    for m in migrations {
+        let text = String.from(m)
+        match ddl.apply(sch.copy(), text.copy()) {
+            Ok(next) => { sch = next }
+            Err(e) => { return Err(sql.format_error(label("migration #", i), text, e)) }
+        }
+        i += 1
+    }
+    Ok(sch)
+}
+
+/// All the problems of the query files against the schema the migrations build, as text lines (empty: all fine),
+/// and the number of queries checked.
+pub fn problems(migrations: List[str], query_files: List[str]) -> (List[String], i32) {
+    let mut out: List[String] = List.new()
+    let sch = match schema_of(migrations) {
+        Ok(x) => x
+        Err(e) => { return (List[e], 0) }
+    }
+    let mut n: i32 = 0
+    let mut fi: usize = 0
+    for f in query_files {
+        let text = String.from(f)
+        let name = label("queries #", fi)
+        fi += 1
+        match queryfile.parse_file(text.copy()) {
+            Ok(qs) => {
+                for q in qs {
+                    n += 1
+                    match queryfile.check_query(sch.copy(), q.copy()) {
+                        Ok(info) => {}
+                        Err(e) => {
+                            let mut m = sql.format_error(name.copy(), text.copy(), e)
+                            m.push_str(" (in ")
+                            m.append(q.name.copy())
+                            m.push_str(")")
+                            out.push(m)
+                        }
+                    }
+                }
+            }
+            Err(e) => { out.push(sql.format_error(name, text, e)) }
+        }
+    }
+    (out, n)
+}
+
+/// Checks the queries against the migrations; the number of queries, or a trap listing every problem.
+pub fn check_all(migrations: List[str], query_files: List[str]) -> i32 {
+    let (ps, n) = problems(migrations, query_files)
+    if ps.len() > 0 {
+        let mut all = s("eider-sql: ")
+        all.append(String.from_int(ps.len() as i64))
+        all.push_str(" problem(s):")
+        for p in ps {
+            all.push_str("\n  ")
+            all.append(p)
+        }
+        panic("{all}")
+    }
+    n
+}
+
+/// Checks that query `name` of `query_files` has the inferred signature `expected`
+/// (`params: $1 int8; columns: id int8; name text?;`, as `sql.check.describe` writes it, `?` marks NULL), so that
+/// a change to a migration that changes the types a query gets breaks the build until the code is updated. Traps
+/// with the actual signature on a mismatch, or when the query is missing or does not check; returns true.
+pub fn expect_signature(migrations: List[str], query_files: List[str], name: str, expected: str) -> bool {
+    let sch = match schema_of(migrations) {
+        Ok(x) => x
+        Err(e) => { panic("{e}") }
+    }
+    for f in query_files {
+        match queryfile.parse_file(String.from(f)) {
+            Ok(qs) => {
+                for q in qs {
+                    if q.name == String.from(name) {
+                        match queryfile.check_query(sch.copy(), q.copy()) {
+                            Ok(info) => {
+                                let got = check.describe(info)
+                                if got != String.from(expected) { panic("query {name}: the signature is now `{got}`, not `{expected}`") }
+                                return true
+                            }
+                            Err(e) => { panic("query {name}: {e.msg}") }
+                        }
+                    }
+                }
+            }
+            Err(e) => { panic("{e.msg}") }
+        }
+    }
+    panic("no such query")
+}

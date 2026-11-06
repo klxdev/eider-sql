@@ -1,0 +1,126 @@
+// Generated code against a real server: the modules `eider-sql gen` wrote for tests/data (tests/data/gen) are
+// compiled with the package and run after the real migrations; the transaction helpers, load_many and the builder
+// run on the same tables.
+
+import std.serial
+import std.time
+import postgres
+import postgres.client
+import sql.build
+import sql.load
+import sql.migrate
+import sql.project
+import sql.tx
+import sql.tests.util
+import sql.tests.data.gen.users as users
+import sql.tests.data.gen.orders as orders
+
+fn s(x: str) -> String { String.from(x) }
+
+@[derive(Deserialize)]
+type NameRow = { id: i64, email: String }
+
+fn main() uses net, io, clock, fs, threads {
+    let mut c = util.admin()
+    let dl = util.dl()
+    let z0 = c.simple("DROP TABLE IF EXISTS orders, users, gen_history CASCADE", dl).unwrap()
+    let ms = project.load_migrations(s("tests/data/migrations")).unwrap()
+    let mut opts = migrate.options()
+    opts.table = s("gen_history")
+    let rep = migrate.up(inout c, ms, opts, dl).unwrap()
+    print("migrated: {rep.ran.len()}")
+
+    let ada = users.create_user(inout c, s("ada@example.org"), Some(s("Ada")), 36, dl).unwrap()
+    let bob = users.create_user(inout c, s("bob@example.org"), None, 41, dl).unwrap()
+    print("created ids {ada.id} {bob.id}, created_at has a year: {ada.created_at.year > 2000}")
+    let got = users.get_user(inout c, ada.id, dl).unwrap()
+    print("get_user: {got.id} {got.email} {got.name} {got.nickname}")
+    match users.get_user(inout c, 9999, dl) {
+        Ok(u) => print("found?")
+        Err(e) => print("get_user of nobody: {e.kind}")
+    }
+    let by_mail = users.find_by_email(inout c, s("bob@example.org"), dl).unwrap()
+    let stranger = users.find_by_email(inout c, s("nobody@x"), dl).unwrap()
+    print("find_by_email: {by_mail.unwrap().id}, none for a stranger: {stranger.is_none()}")
+    let changed = users.rename_user(inout c, Some(s("Robert")), Some(s("bobby")), bob.id, dl).unwrap()
+    let bob2 = users.get_user(inout c, bob.id, dl).unwrap()
+    print("rename_user changed {changed}: {bob2.name} {bob2.nickname}")
+    let none_name = users.rename_user(inout c, None, None, bob.id, dl).unwrap()
+    let bob3 = users.get_user(inout c, bob.id, dl).unwrap()
+    print("rename to NULL: {bob3.name} {bob3.nickname}")
+    let active = users.list_active(inout c, 40, 10, dl).unwrap()
+    print("list_active(min 40): {active.len()} -> {active[0].email} {active[0].age} {active[0].score} {active[0].tags}")
+    let by_ids = users.users_by_ids(inout c, List[ada.id, bob.id, 12345], dl).unwrap()
+    print("users_by_ids: {by_ids.len()} rows, first {by_ids[0].email}")
+
+    // orders, a transaction that commits, one that rolls back
+    let o1 = tx.run(inout c, dl, |inout t| -> Result[i64, postgres.Error] {
+        let a = orders.add_order(inout t, ada.id, s("19.90"), Some(s("first")), dl)?
+        let b = orders.add_order(inout t, ada.id, s("5.00"), None, dl)?
+        Ok(a.id + b.id)
+    })
+    print("committed: {o1.is_ok()}")
+    let o2 = tx.run(inout c, dl, |inout t| -> Result[i64, postgres.Error] {
+        let a = orders.add_order(inout t, bob.id, s("1.00"), None, dl)?
+        let bad = orders.add_order(inout t, 987654, s("2.00"), None, dl)?
+        Ok(bad.id)
+    })
+    match o2 {
+        Ok(v) => print("no error?")
+        Err(e) => print("rolled back on {e.sqlstate}")
+    }
+    let ada_orders = orders.orders_of(inout c, ada.id, dl).unwrap()
+    let bob_orders = orders.orders_of(inout c, bob.id, dl).unwrap()
+    print("ada has {ada_orders.len()} orders, bob has {bob_orders.len()}: {ada_orders[0].total} {ada_orders[0].note} {ada_orders[1].note}")
+
+    // load_many: one query for many keys
+    let grouped = load.load_many_by[orders.OrdersByUsersRow, i64, str](inout c, orders.ORDERS_BY_USERS_SQL, load.ints(List[ada.id, bob.id]), |o| -> i64 { o.user_id }, dl).unwrap()
+    print("load_many_by: {grouped.len()} keys, ada's group {grouped.get(ada.id).unwrap().len()}")
+    let many = load.load_many_chunked[orders.OrdersByUsersRow, str](inout c, orders.ORDERS_BY_USERS_SQL, load.ints(List[ada.id, bob.id, 5, 6, 7]), 2, dl).unwrap()
+    print("chunked by 2: {many.len()} rows")
+    let none = load.load_many[orders.OrdersByUsersRow, str](inout c, orders.ORDERS_BY_USERS_SQL, List.new(), dl).unwrap()
+    print("no keys: {none.len()} rows")
+    let totals = orders.user_totals(inout c, dl).unwrap()
+    for t in totals { print("totals: {t.user_id} {t.email} {t.orders} {t.total}") }
+
+    // the builder, run
+    let b = build.select(s("users"), build.names(List["id", "email"]))
+        .where_in(s("id"), load.ints(List[ada.id, bob.id]))
+        .where_cmp(s("age"), build.Ge, postgres.Int(40))
+        .order_by(s("id"), build.Desc)
+        .limit(5)
+        .build().unwrap()
+    let rows = build.query[NameRow](inout c, b, dl).unwrap()
+    print("builder: {rows.len()} rows: {rows[0].email}")
+    let upd = build.update(s("users")).set(s("score"), postgres.Float(9.5)).where_eq(s("id"), postgres.Int(ada.id)).build().unwrap()
+    print("builder update: {build.exec(inout c, upd, dl).unwrap()}")
+    let ins = build.insert_into(s("users"), build.names(List["email", "age"]))
+        .row(List[postgres.Text(s("c@x")), postgres.Int(1)])
+        .row(List[postgres.Text(s("d@x")), postgres.Int(2)])
+        .returning(build.names(List["id"]))
+        .build().unwrap()
+    print("builder batch insert: {build.query[NameIdOnly](inout c, ins, dl).unwrap().len()} rows")
+    // an injection attempt is only a value
+    let evil = build.select(s("users"), build.names(List["id"])).where_eq(s("email"), postgres.Text(s("x' OR '1'='1"))).build().unwrap()
+    print("injection attempt matches {build.query[NameIdOnly](inout c, evil, dl).unwrap().len()} rows")
+
+    // isolation and retry
+    let iso = tx.run_isolated(inout c, tx.Serializable, true, dl, |inout t| -> Result[i64, postgres.Error] {
+        let rs = t.query("SHOW transaction_isolation", List.new(), dl)?
+        Ok(rs.rows.len() as i64)
+    })
+    print("serializable read-only transaction ran: {iso.is_ok()}")
+    let mut tries = 0
+    let r = tx.retry(inout c, 3, tx.ReadCommitted, dl, |inout t| -> Result[i64, postgres.Error] {
+        Ok(1)
+    })
+    print("retry ok: {r.is_ok()}")
+    let plain = postgres.fail(postgres.Usage, "x")
+    print("a usage error is retryable: {tx.retryable(plain)}")
+
+    let z1 = c.simple("DROP TABLE IF EXISTS orders, users, gen_history CASCADE", dl).unwrap()
+    c.close()
+}
+
+@[derive(Deserialize)]
+type NameIdOnly = { id: i64 }

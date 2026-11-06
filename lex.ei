@@ -1,0 +1,308 @@
+//! sql.lex: a lexer for the PostgreSQL dialect (as much as the checker reads).
+//!
+//! `lex(src)` turns text into tokens. Unquoted words are lowercased (`T_WORD`), quoted identifiers
+//! keep their text (`T_QUOTED`), string literals are decoded (`T_STR`: `''` and, for `E'...'`, the usual
+//! backslash escapes; dollar-quoted strings too), numbers are `T_NUM`, `$1` is `T_PARAM` (text `1`),
+//! `:name` is `T_NAMED`, and everything else is `T_OP` (punctuation and operators, `::` included).
+//! Comments are dropped (`lex_with_comments` keeps `--` comments as `T_COMMENT` for the annotations of
+//! query files). It never traps: bad input is an `Error` with the byte offset.
+
+import std.utf8
+import sql
+
+pub const T_EOF: u8 = 0
+pub const T_WORD: u8 = 1
+pub const T_QUOTED: u8 = 2
+pub const T_NUM: u8 = 3
+pub const T_STR: u8 = 4
+pub const T_PARAM: u8 = 5
+pub const T_NAMED: u8 = 6
+pub const T_OP: u8 = 7
+pub const T_COMMENT: u8 = 8
+
+/// A token: its kind, its text (see the module comment), and where it is in the source.
+pub type Tok = { kind: u8, text: String, pos: usize, end: usize }
+
+/// The most tokens one text may have; a bigger one is an error, never a slow or huge run.
+pub const MAX_TOKENS: usize = 200000
+
+fn is_word_start(b: u8) -> bool { (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || b == 95 || b >= 128 }
+fn is_word_char(b: u8) -> bool { is_word_start(b) || (b >= 48 && b <= 57) || b == 36 }
+fn is_digit(b: u8) -> bool { b >= 48 && b <= 57 }
+fn is_space(b: u8) -> bool { b == 32 || b == 9 || b == 10 || b == 13 || b == 11 || b == 12 }
+
+fn is_op_char(b: u8) -> bool {
+    b == 43 || b == 45 || b == 42 || b == 47 || b == 60 || b == 62 || b == 61 || b == 126 || b == 33 || b == 64 || b == 35 || b == 37 || b == 94 || b == 38 || b == 124 || b == 96 || b == 63
+}
+
+fn is_special_op_char(b: u8) -> bool {
+    b == 126 || b == 33 || b == 64 || b == 35 || b == 37 || b == 94 || b == 38 || b == 124 || b == 96 || b == 63
+}
+
+fn text_of(b: List[u8]) -> String { utf8.lossy(b) }
+
+fn tok(kind: u8, text: String, pos: usize, end: usize) -> Tok { Tok(kind, text, pos, end) }
+
+fn at(s: String, i: usize) -> u8 { if i < s.len() { s.byte(i) } else { 0 } }
+
+/// Lexes `src`, dropping comments.
+pub fn lex(src: String) -> Result[List[Tok], sql.Error] { lex_inner(src, false) }
+
+/// Lexes `src`, keeping `--` comments (as `T_COMMENT` tokens whose text is the comment after the dashes).
+pub fn lex_with_comments(src: String) -> Result[List[Tok], sql.Error] { lex_inner(src, true) }
+
+fn lex_inner(src: String, keep: bool) -> Result[List[Tok], sql.Error] {
+    let mut out: List[Tok] = List.new()
+    let n = src.len()
+    let mut i: usize = 0
+    while i < n {
+        if out.len() > MAX_TOKENS { return Err(sql.error(String.from("the text has too many tokens"), i)) }
+        let c = src.byte(i)
+        if is_space(c) {
+            i += 1
+            continue
+        }
+        // comments
+        if c == 45 && at(src, i + 1) == 45 {
+            let start = i.copy()
+            let mut j = i + 2
+            while j < n && src.byte(j) != 10 { j += 1 }
+            if keep { out.push(tok(T_COMMENT, src.slice(start + 2, j), start, j)) }
+            i = j
+            continue
+        }
+        if c == 47 && at(src, i + 1) == 42 {
+            let start = i.copy()
+            let mut depth: usize = 1
+            let mut j = i + 2
+            while j < n && depth > 0 {
+                if src.byte(j) == 47 && at(src, j + 1) == 42 {
+                    depth += 1
+                    j += 2
+                } else if src.byte(j) == 42 && at(src, j + 1) == 47 {
+                    depth -= 1
+                    j += 2
+                } else {
+                    j += 1
+                }
+            }
+            if depth > 0 { return Err(sql.error(String.from("unterminated /* comment"), start)) }
+            i = j
+            continue
+        }
+        // words (and E'...' / B'...' / X'...' string prefixes)
+        if is_word_start(c) {
+            let start = i.copy()
+            let mut j = i + 1
+            while j < n && is_word_char(src.byte(j)) && src.byte(j) != 36 { j += 1 }
+            // $ inside a word is allowed by PostgreSQL but rare; keep it simple and accept it
+            while j < n && is_word_char(src.byte(j)) { j += 1 }
+            let w = src.slice(start, j)
+            if j < n && src.byte(j) == 39 && j - start == 1 && (c == 69 || c == 101) {
+                let (s, e) = read_string(src, j, true)?
+                out.push(tok(T_STR, s, start, e))
+                i = e
+                continue
+            }
+            if j < n && src.byte(j) == 39 && j - start == 1 && (c == 66 || c == 98 || c == 88 || c == 120) {
+                let (s, e) = read_string(src, j, false)?
+                out.push(tok(T_STR, s, start, e))
+                i = e
+                continue
+            }
+            out.push(tok(T_WORD, sql.lower(w), start, j))
+            i = j
+            continue
+        }
+        if is_digit(c) || (c == 46 && is_digit(at(src, i + 1))) {
+            let start = i.copy()
+            let mut j = i.copy()
+            while j < n && is_digit(src.byte(j)) { j += 1 }
+            if j < n && src.byte(j) == 46 && at(src, j + 1) != 46 {
+                j += 1
+                while j < n && is_digit(src.byte(j)) { j += 1 }
+            }
+            if j < n && (src.byte(j) == 101 || src.byte(j) == 69) {
+                let mut k = j + 1
+                if k < n && (src.byte(k) == 43 || src.byte(k) == 45) { k += 1 }
+                if k < n && is_digit(src.byte(k)) {
+                    while k < n && is_digit(src.byte(k)) { k += 1 }
+                    j = k
+                }
+            }
+            out.push(tok(T_NUM, src.slice(start, j), start, j))
+            i = j
+            continue
+        }
+        if c == 39 {
+            let (s, e) = read_string(src, i, false)?
+            out.push(tok(T_STR, s, i, e))
+            i = e
+            continue
+        }
+        if c == 34 {
+            let start = i.copy()
+            let mut j = i + 1
+            let mut buf: List[u8] = List.new()
+            let mut closed = false
+            while j < n {
+                let d = src.byte(j)
+                if d == 34 {
+                    if at(src, j + 1) == 34 {
+                        buf.push(34)
+                        j += 2
+                        continue
+                    }
+                    closed = true
+                    j += 1
+                    break
+                }
+                buf.push(d)
+                j += 1
+            }
+            if !closed { return Err(sql.error(String.from("unterminated quoted identifier"), start)) }
+            if buf.len() == 0 { return Err(sql.error(String.from("zero-length delimited identifier"), start)) }
+            out.push(tok(T_QUOTED, text_of(buf), start, j))
+            i = j
+            continue
+        }
+        if c == 36 {
+            // $1 is a parameter; $tag$ ... $tag$ is a string
+            if is_digit(at(src, i + 1)) {
+                let start = i.copy()
+                let mut j = i + 1
+                while j < n && is_digit(src.byte(j)) { j += 1 }
+                out.push(tok(T_PARAM, src.slice(start + 1, j), start, j))
+                i = j
+                continue
+            }
+            let start = i.copy()
+            let mut j = i + 1
+            while j < n && is_word_char(src.byte(j)) && src.byte(j) != 36 { j += 1 }
+            if j < n && src.byte(j) == 36 {
+                let tag = src.slice(start, j + 1)
+                match find_from(src, tag.copy(), j + 1) {
+                    Some(k) => {
+                        out.push(tok(T_STR, src.slice(j + 1, k), start, k + tag.len()))
+                        i = k + tag.len()
+                        continue
+                    }
+                    None => { return Err(sql.error(String.from("unterminated dollar-quoted string"), start)) }
+                }
+            }
+            return Err(sql.error(String.from("unexpected `$`"), start))
+        }
+        if c == 58 {
+            if at(src, i + 1) == 58 {
+                out.push(tok(T_OP, String.from("::"), i, i + 2))
+                i += 2
+                continue
+            }
+            if is_word_start(at(src, i + 1)) && at(src, i + 1) < 128 {
+                let start = i.copy()
+                let mut j = i + 1
+                while j < n && is_word_char(src.byte(j)) && src.byte(j) != 36 { j += 1 }
+                out.push(tok(T_NAMED, src.slice(start + 1, j), start, j))
+                i = j
+                continue
+            }
+            out.push(tok(T_OP, String.from(":"), i, i + 1))
+            i += 1
+            continue
+        }
+        if c == 40 || c == 41 || c == 44 || c == 59 || c == 46 || c == 91 || c == 93 || c == 123 || c == 125 {
+            out.push(tok(T_OP, src.slice(i, i + 1), i, i + 1))
+            i += 1
+            continue
+        }
+        if is_op_char(c) {
+            let start = i.copy()
+            let mut j = i.copy()
+            let mut special = false
+            while j < n && is_op_char(src.byte(j)) {
+                // a comment starts inside an operator
+                if src.byte(j) == 45 && at(src, j + 1) == 45 { break }
+                if src.byte(j) == 47 && at(src, j + 1) == 42 { break }
+                if is_special_op_char(src.byte(j)) { special = true }
+                j += 1
+            }
+            // an operator ending in + or - needs a special character; otherwise cut those off
+            while j > start + 1 && !special && (src.byte(j - 1) == 43 || src.byte(j - 1) == 45) { j -= 1 }
+            if j == start { j = start + 1 }
+            out.push(tok(T_OP, src.slice(start, j), start, j))
+            i = j
+            continue
+        }
+        return Err(sql.error(String.from("unexpected character"), i))
+    }
+    out.push(tok(T_EOF, String.from(""), n, n))
+    Ok(out)
+}
+
+fn find_from(s: String, needle: String, from: usize) -> Option[usize] {
+    if needle.len() == 0 { return None }
+    if needle.len() > s.len() { return None }
+    let last = s.len() - needle.len()
+    let mut i = from.copy()
+    while i <= last {
+        if s.byte(i) == needle.byte(0) {
+            let mut k: usize = 1
+            while k < needle.len() && s.byte(i + k) == needle.byte(k) { k += 1 }
+            if k == needle.len() { return Some(i) }
+        }
+        i += 1
+    }
+    None
+}
+
+/// Reads the string literal whose opening quote is at `open`; returns its text and the offset after it.
+fn read_string(src: String, open: usize, escapes: bool) -> Result[(String, usize), sql.Error] {
+    let n = src.len()
+    let mut j = open + 1
+    let mut buf: List[u8] = List.new()
+    while j < n {
+        let d = src.byte(j)
+        if d == 39 {
+            if at(src, j + 1) == 39 {
+                buf.push(39)
+                j += 2
+                continue
+            }
+            return Ok((text_of(buf), j + 1))
+        }
+        if escapes && d == 92 && j + 1 < n {
+            let e = src.byte(j + 1)
+            if e == 110 { buf.push(10) } else if e == 116 { buf.push(9) } else if e == 114 { buf.push(13) } else { buf.push(e) }
+            j += 2
+            continue
+        }
+        buf.push(d)
+        j += 1
+    }
+    Err(sql.error(String.from("unterminated string literal"), open))
+}
+
+/// A short description of a token for messages: `end of input`, `` `select` ``, a string as `'...'`.
+pub fn describe(t: Tok) -> String {
+    if t.kind == T_EOF { return String.from("end of input") }
+    let mut m = String.from("`")
+    if t.kind == T_STR {
+        m.push_str("'")
+        m.append(t.text.copy())
+        m.push_str("'")
+    } else if t.kind == T_PARAM {
+        m.push_str("$")
+        m.append(t.text.copy())
+    } else if t.kind == T_NAMED {
+        m.push_str(":")
+        m.append(t.text.copy())
+    } else if t.kind == T_QUOTED {
+        m.push_str("\"")
+        m.append(t.text.copy())
+        m.push_str("\"")
+    } else {
+        m.append(t.text.copy())
+    }
+    m.push_str("`")
+    m
+}

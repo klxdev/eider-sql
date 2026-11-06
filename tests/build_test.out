@@ -1,0 +1,56 @@
+plain select
+  SELECT "id", "email" FROM "users"
+  params: []
+filters
+  SELECT "id", "email" FROM "users" WHERE "active" = $1 AND "age" >= $2 AND "id" = ANY($3) AND "email" IS NOT NULL AND "deleted_at" IS NULL ORDER BY "created_at" DESC, "id" LIMIT $4 OFFSET $5
+  params: [Bool(true), Int(18), Array([Int(1), Int(2), Int(3)]), Int(50), Int(100)]
+sort from the allowed list
+  SELECT "id" FROM "users" ORDER BY "email" DESC
+  params: []
+sort outside the allowed list
+  error: cannot sort by password_hash; DROP TABLE users
+injection in a value is just a value
+  SELECT "id" FROM "users" WHERE "email" = $1
+  params: [Text("x' OR '1'='1")]
+injection in a column
+  error: not a valid column name: email = 1 OR 1
+injection in a table
+  error: not a valid table name: users; DROP TABLE users
+injection in a select column
+  error: not a valid column name: id, (SELECT 1)
+quote in a name
+  error: not a valid table name: us"ers
+no columns
+  error: SELECT needs at least one column
+negative limit
+  error: LIMIT must not be negative
+batch insert
+  INSERT INTO "users" ("email", "name") VALUES ($1, $2), ($3, $4) RETURNING "id"
+  params: [Text("a@x"), Text("A"), Text("b@x"), Null]
+insert row of the wrong length
+  error: an INSERT row must have a value for each column
+insert without rows
+  error: INSERT needs at least one row
+update
+  UPDATE "users" SET "name" = $1, "age" = $2 WHERE "id" = $3 RETURNING "id"
+  params: [Text("N"), Int(3), Int(7)]
+update without a condition
+  error: UPDATE without a condition; call all_rows() if every row is meant
+update of every row, said so
+  UPDATE "users" SET "name" = $1
+  params: [Null]
+delete
+  DELETE FROM "users" WHERE "id" = ANY($1)
+  params: [Array([Int(5), Int(6)])]
+delete without a condition
+  error: DELETE without a condition; call all_rows() if every row is meant
+against the schema: fine
+  SELECT "id", "email" FROM "users" WHERE "name" = $1
+  params: [Text("x")]
+against the schema: a typo in a column
+  error: no such column in users: emial
+against the schema: a typo in a table
+  error: no such table: usres
+against the schema: a filter on an unknown column
+  error: no such column in users: nope
+grouped: keys 2, group 1 has 2

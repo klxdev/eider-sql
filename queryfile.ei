@@ -1,0 +1,228 @@
+//! sql.queryfile: reads a `.sql` file of annotated queries (sqlc style):
+//!
+//! ```sql
+//! -- name: GetUser :one
+//! SELECT id, email FROM users WHERE id = :id;
+//!
+//! -- name: ListUsers :many
+//! SELECT id, email FROM users WHERE created_at > $1 ORDER BY id;
+//! ```
+//!
+//! The comment `-- name: <Name> :<kind>` starts a query; the kind is `one` (exactly one row),
+//! `opt` (at most one row), `many` (any number) or `exec` (no rows; the result is the number of rows
+//! changed). Comment lines between the annotation and the statement document the generated function.
+//! Parameters are `$1`, `$2`, ... or named, `:name` (numbered by first appearance, the same name is the same
+//! parameter); a query uses one form. Positions in errors are byte offsets in the file.
+
+import sql
+import sql.check
+import sql.lex
+import sql.parse
+import sql.schema
+
+pub type Query = {
+    name: String,
+    kind: String,
+    /// The statement with every `:name` replaced by `$n`, without the final `;`.
+    text: String,
+    /// The tokens of the statement, `:name` already `$n`, ending with EOF.
+    toks: List[lex.Tok],
+    /// Parameter names by position: the `:name`s, or `p1`, `p2`, ... for positional parameters.
+    param_names: List[String],
+    pos: usize,
+    doc: List[String]
+}
+
+fn s(x: str) -> String { String.from(x) }
+
+fn is_kind(k: String) -> bool { k == s("one") || k == s("opt") || k == s("many") || k == s("exec") }
+
+fn ident_ok(n: String) -> bool {
+    if n.len() == 0 || n.len() > 60 { return false }
+    for i in 0..n.len() {
+        let b = n.byte(i)
+        let letter = (b >= 65 && b <= 90) || (b >= 97 && b <= 122)
+        let digit = b >= 48 && b <= 57
+        if !(letter || (i > 0 && (digit || b == 95)) || (i == 0 && false)) { return false }
+        if i == 0 && !letter { return false }
+    }
+    true
+}
+
+fn trim(t: String) -> String {
+    let mut a: usize = 0
+    let mut b = t.len()
+    while a < b && (t.byte(a) == 32 || t.byte(a) == 9 || t.byte(a) == 13) { a += 1 }
+    while b > a && (t.byte(b - 1) == 32 || t.byte(b - 1) == 9 || t.byte(b - 1) == 13) { b -= 1 }
+    t.slice(a, b)
+}
+
+/// The words of an annotation comment, or None when the comment is not one.
+fn annotation(text: String) -> Option[List[String]] {
+    let t = trim(text)
+    if !(t.len() >= 5 && t.slice(0, 5) == s("name:")) { return None }
+    let rest = t.slice(5, t.len())
+    let mut words: List[String] = List.new()
+    let mut cur = s("")
+    for i in 0..rest.len() {
+        let b = rest.byte(i)
+        if b == 32 || b == 9 {
+            if cur.len() > 0 { words.push(cur) }
+            cur = s("")
+        } else {
+            cur.push_byte(b)
+        }
+    }
+    if cur.len() > 0 { words.push(cur) }
+    Some(words)
+}
+
+/// Reads the queries of `src`.
+pub fn parse_file(src: String) -> Result[List[Query], sql.Error] {
+    let toks = lex.lex_with_comments(src.copy())?
+    let mut out: List[Query] = List.new()
+    let mut i: usize = 0
+    let n = toks.len()
+    let mut pending: Option[(String, String, usize)] = None
+    let mut doc: List[String] = List.new()
+    while i < n {
+        let t = toks[i].copy()
+        if t.kind == lex.T_EOF { break }
+        if t.kind == lex.T_COMMENT {
+            match annotation(t.text.copy()) {
+                Some(words) => {
+                    if pending.is_some() { return Err(sql.error(s("the annotation above has no statement"), t.pos)) }
+                    if words.len() != 2 || words[1].len() < 2 || words[1].byte(0) != 58 {
+                        return Err(sql.error(s("expected `-- name: <Name> :<kind>`"), t.pos))
+                    }
+                    let kind = words[1].slice(1, words[1].len())
+                    if !is_kind(kind.copy()) { return Err(sql.error(s("the kind of a query is :one, :opt, :many or :exec"), t.pos)) }
+                    if !ident_ok(words[0].copy()) { return Err(sql.error(s("a query name is letters, digits and `_`, starting with a letter"), t.pos)) }
+                    for q in out.copy() {
+                        if q.name == words[0] { return Err(sql.error(s("the query name is used twice"), t.pos)) }
+                    }
+                    pending = Some((words[0].copy(), kind, t.pos))
+                    doc = List.new()
+                }
+                None => {
+                    if pending.is_some() { doc.push(trim(t.text.copy())) }
+                }
+            }
+            i += 1
+            continue
+        }
+        // a statement: tokens up to `;` or the end
+        let start = i
+        let mut stmt: List[lex.Tok] = List.new()
+        while i < n && toks[i].kind != lex.T_EOF && !(toks[i].kind == lex.T_OP && toks[i].text == s(";")) {
+            if toks[i].kind != lex.T_COMMENT { stmt.push(toks[i].copy()) }
+            i += 1
+        }
+        let end_pos = if i < n { toks[i].pos } else { src.len() }
+        if i < n && toks[i].kind == lex.T_OP { i += 1 }
+        let pend = match pending {
+            Some(p) => p
+            None => { return Err(sql.error(s("a statement needs `-- name: <Name> :<kind>` above it"), t.pos)) }
+        }
+        let (name, kind, apos) = pend
+        pending = None
+        let q = build(src.copy(), name, kind, apos, stmt, end_pos, doc.copy())?
+        out.push(q)
+        doc = List.new()
+    }
+    if pending.is_some() {
+        let (name, kind, apos) = pending.unwrap()
+        return Err(sql.error(s("the annotation has no statement"), apos))
+    }
+    Ok(out)
+}
+
+fn build(src: String, name: String, kind: String, apos: usize, stmt: List[lex.Tok], end_pos: usize, doc: List[String]) -> Result[Query, sql.Error] {
+    let mut named: List[String] = List.new()
+    let mut positional = false
+    let mut max_pos: i32 = 0
+    let mut toks: List[lex.Tok] = List.new()
+    let mut repl: List[(usize, usize, String)] = List.new()
+    for t in stmt {
+        if t.kind == lex.T_NAMED {
+            if positional { return Err(sql.error(s("a query uses named (:name) or positional ($n) parameters, not both"), t.pos)) }
+            let mut idx: i32 = 0
+            let mut k: usize = 0
+            while k < named.len() {
+                if named[k] == t.text { idx = (k + 1) as i32 }
+                k += 1
+            }
+            if idx == 0 {
+                named.push(t.text.copy())
+                idx = named.len() as i32
+            }
+            let num = String.from_int(idx as i64)
+            let mut ps = s("$")
+            ps.append(num.copy())
+            repl.push((t.pos, t.end, ps))
+            toks.push(lex.Tok(lex.T_PARAM, num, t.pos, t.end))
+        } else {
+            if t.kind == lex.T_PARAM {
+                if named.len() > 0 { return Err(sql.error(s("a query uses named (:name) or positional ($n) parameters, not both"), t.pos)) }
+                positional = true
+                let v = parse_num(t.text.copy())
+                if v > max_pos { max_pos = v }
+            }
+            toks.push(t.copy())
+        }
+    }
+    if stmt.len() == 0 { return Err(sql.error(s("the query has no statement"), apos)) }
+    let first = stmt[0].pos
+    let last_end = stmt[stmt.len() - 1].end
+    toks.push(lex.Tok(lex.T_EOF, s(""), last_end, last_end))
+    // the statement text with the replacements
+    let mut text = s("")
+    let mut at = first.copy()
+    for r in repl {
+        let (a, b, rep) = r
+        text.append(src.slice(at, a))
+        text.append(rep)
+        at = b
+    }
+    text.append(src.slice(at, last_end))
+    let mut names: List[String] = List.new()
+    if positional {
+        let mut i: i32 = 1
+        while i <= max_pos {
+            let mut p = s("p")
+            p.append(String.from_int(i as i64))
+            names.push(p)
+            i += 1
+        }
+    } else {
+        names = named
+    }
+    Ok(Query(name, kind, text, toks, names, apos, doc))
+}
+
+fn parse_num(t: String) -> i32 {
+    if t.len() == 0 || t.len() > 5 { return 99999 }
+    let mut v: i32 = 0
+    for i in 0..t.len() { v = v * 10 + ((t.byte(i) - 48) as i32) }
+    v
+}
+
+/// Checks one query of a file against the schema; the `Info` has the parameters in order.
+pub fn check_query(sch: schema.Schema, q: Query) -> Result[check.Info, sql.Error] {
+    let st = parse.statement(q.toks.copy())?
+    let info = check.check(sch, st)?
+    if info.params.len() != q.param_names.len() && q.param_names.len() > 0 {
+        return Err(sql.error(s("internal: parameter count mismatch"), q.pos))
+    }
+    if info.kind != check.K_SELECT && !(q.kind == s("exec")) {
+        // INSERT/UPDATE/DELETE ... RETURNING can be :one/:opt/:many
+        if info.cols.len() == 0 { return Err(sql.error(s("a statement that returns no rows must be :exec"), q.pos)) }
+    }
+    if q.kind == s("exec") && info.cols.len() > 0 {
+        return Err(sql.error(s("an :exec statement must not return rows (drop RETURNING, or use :one/:many)"), q.pos))
+    }
+    if q.kind != s("exec") && info.cols.len() == 0 {
+        return Err(sql.error(s("a :one/:opt/:many query must return rows"), q.pos))
+    }
+    Ok(info)
+}

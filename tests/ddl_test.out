@@ -1,0 +1,81 @@
+== create
+table users
+  id int8 not null default pk
+  email text not null
+  name text
+  age int4 not null default
+  score float8
+  created_at timestamptz not null default
+  tags text[] not null default
+  meta jsonb
+  balance numeric not null default
+  unique (email)
+index users_email_idx on users
+unique index users_name on users
+
+== constraints
+table a
+  id int4 not null pk
+  b int4 not null pk
+table b
+  id int4 not null default pk
+  a_id int4 not null
+  c int4 not null
+  d int4
+  full_name text default
+  fk (a_id) -> a()
+  fk (d) -> a(id)
+  unique (a_id, c)
+
+== alter
+table t2
+  id int4 not null pk
+  a text not null
+  c int4 not null default
+  e text
+  fk (c) -> t(id)
+  unique (a)
+
+== drop
+table a
+  id int4
+
+== enum
+table person
+  id int4
+  m mood not null
+  ms mood[]
+enum mood (sad, ok, happy, ecstatic)
+
+== skipped
+note: skipped CREATE view v
+note: skipped CREATE TABLE copy_of (LIKE): the checker does not know its columns
+note: skipped CREATE TABLE p2 (AS or PARTITION OF): the checker does not know its columns
+
+== two migrations
+table a
+  id int4
+  x text
+
+== duplicate table
+error: m0: table "a" already exists @38
+== duplicate column
+error: m0: column "id" specified more than once @13
+== alter missing table
+error: m0: relation "a" does not exist @12
+== drop missing column
+error: m0: column "x" of relation "a" does not exist @39
+== index on missing column
+error: m0: column "nope" of relation "a" does not exist @46
+== syntax error
+error: m0: expected a name, found `,` @23
+== unterminated
+error: m0: expected `)`, found end of input @22
+== garbage
+error: m0: unterminated string literal @11
+== empty
+
+== deep
+table a
+  id int4
+

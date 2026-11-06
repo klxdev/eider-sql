@@ -1,0 +1,48 @@
+== file names and checksums
+001_create_users.sql: version 1 name create_users
+7_x.sql: version 7 name x
+0_zero.sql: refused
+abc.sql: refused
+001.sql: refused
+001_a b.sql: refused
+001_users.txt: refused
+99999999999999999999_big.sql: refused
+checksum ignores CRLF: true; differs for other text: true
+duplicate versions: two migrations have the version 1: a and b
+== plan, up, up again
+ok: ran [1 2 10 ] already 0 dry true
+history table created by a dry run: false
+pending:1 pending:2 pending:10 
+ok: ran [1 2 10 ] already 0 dry false
+history rows 3, log rows 4
+ok: ran [] already 3 dry false
+applied:1 applied:2 applied:10 
+log rows still 4
+== a new migration is applied, in order
+ok: ran [11 ] already 3 dry true
+ok: ran [11 ] already 3 dry false
+== edited, missing, out of order, renamed
+error: migration 2 (more): edited after it was applied (applied checksum fnv64:397165e6ccc79776:70, now fnv64:fe16c5e03cf19712:37)
+applied:1 changed:2 applied:10 applied:11 
+error: migration 2 (more): applied, but not in the list of migrations
+applied:1 applied:10 applied:11 missing:2 
+error: migration 2 (other_name): applied under the name more
+ok: ran [1 5 ] already 0 dry false
+error: migration 3 (three) is pending but a later version (5) is already applied: migrations only go forward
+log rows unchanged by all of that: 5
+== a failing migration leaves nothing behind
+error: migration 2 (bad) failed: relation "no_such_table" does not exist
+mt_a (migration 1) exists: true; mt_b (migration 2) exists: false; mt_never: false
+applied:1 pending:2 pending:3 
+usable after the failure: true, in a transaction: false
+advisory locks still held: Int(0)
+== no-transaction migrations
+ok: ran [1 2 ] already 0 dry false
+flag read: true, false
+== bad options
+error: the history table must be a lowercase unquoted identifier
+error: two migrations have the version 1: a and b
+== runners racing on the advisory lock
+runners: 6, failed 0, migrations run in total 8 (each exactly once: true)
+race table rows 7, history rows 8
+migration bodies that ran twice: Int(0)

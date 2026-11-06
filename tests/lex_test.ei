@@ -1,0 +1,73 @@
+// The lexer: words, quoting, strings, numbers, parameters, operators, comments, and hostile input.
+
+import sql
+import sql.lex
+
+fn kind(k: u8) -> str {
+    if k == lex.T_WORD { "word" } else if k == lex.T_QUOTED { "quoted" } else if k == lex.T_NUM { "num" } else if k == lex.T_STR { "str" } else if k == lex.T_PARAM { "param" } else if k == lex.T_NAMED { "named" } else if k == lex.T_OP { "op" } else if k == lex.T_COMMENT { "comment" } else { "eof" }
+}
+
+fn show(src: str) uses io {
+    match lex.lex(String.from(src)) {
+        Ok(ts) => {
+            let mut line = String.from("")
+            for t in ts {
+                if t.kind != lex.T_EOF {
+                    line.push_str(kind(t.kind))
+                    line.push_str(":")
+                    line.append(t.text.copy())
+                    line.push_str(" ")
+                }
+            }
+            print("ok   {line}")
+        }
+        Err(e) => print("err  {e.msg} @{e.pos}")
+    }
+}
+
+fn main() uses io {
+    show("SELECT id, Name FROM Users WHERE id = $1 AND x = :who")
+    show("select \"Mixed Case\".\"a\"\"b\" from t")
+    show("select 'it''s', E'a\\nb', $$dollar 'quoted'$$, $tag$x$tag$")
+    show("select 1, 2.5, .5, 1e10, 1.5e-3, 1..2")
+    show("select a::int8, b <> c, d >= e, f || g, h -> 'k', i ->> 'k'")
+    show("select a*-1, b+-2, c--comment\n, d /* block /* nested */ */ , e")
+    show("select a<-1")
+    show("select 'unterminated")
+    show("select \"unterminated")
+    show("select /* unterminated")
+    show("select $$ unterminated")
+    show("select $")
+    show("select \"\"")
+    show("select ~x, @y, a @> b, a && b")
+    show("")
+    show("   \n\t ")
+    show("select 'é', \"naïve\", café")
+    show("select ?")
+    show("select {{a}}")
+    match lex.lex_with_comments(String.from("-- name: GetUser :one\nselect 1 -- tail\n")) {
+        Ok(ts) => {
+            for t in ts { print("{kind(t.kind)} [{t.text}] {t.pos}-{t.end}") }
+        }
+        Err(e) => print("err {e.msg}")
+    }
+    // hostile: every byte value, deep and long input never trap
+    let mut all: List[u8] = List.new()
+    for b in 1..128 { all.push(b as u8) }
+    match String.from_bytes(all) {
+        Ok(s) => {
+            match lex.lex(s) {
+                Ok(ts) => print("all ascii: {ts.len()} tokens")
+                Err(e) => print("all ascii: err {e.msg} @{e.pos}")
+            }
+        }
+        Err(_) => print("not utf8")
+    }
+    let mut deep = String.from("")
+    for i in 0..5000 { deep.push_str("((") }
+    match lex.lex(deep) {
+        Ok(ts) => print("deep: {ts.len()} tokens")
+        Err(e) => print("deep: err {e.msg}")
+    }
+    print(sql.format_error(String.from("q.sql"), String.from("a\nbcd"), sql.error(String.from("boom"), 3)))
+}

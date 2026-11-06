@@ -1,0 +1,878 @@
+//! sql.parse: parses one SELECT, INSERT, UPDATE or DELETE statement (the subset docs/design.md lists)
+//! into a syntax tree for the checker. It reads no schema. What it does not read it names:
+//! `unsupported: <what>` with the position (WITH, UNION, subqueries, window functions, ...).
+//!
+//! Expressions are `Node`s: a kind (`N_*`), a name, a qualifier, the position, and children. Parameters
+//! are `$n` tokens; the named form `:name` is turned into `$n` before parsing (`sql.queryfile`).
+
+import sql
+import sql.cursor
+import sql.ddl
+import sql.lex
+import sql.schema
+
+pub const N_COL: u8 = 1      // name, qual ("" when not qualified)
+pub const N_STAR: u8 = 2     // `*` or `qual.*` (select items and count(*) only)
+pub const N_INT: u8 = 3      // name = the digits
+pub const N_NUM: u8 = 4      // a numeric literal with a point or exponent
+pub const N_STR: u8 = 5
+pub const N_BOOL: u8 = 6     // name = "true" / "false"
+pub const N_NULL: u8 = 7
+pub const N_PARAM: u8 = 8    // name = the number
+pub const N_CAST: u8 = 9     // name = type, qual = "[]" for an array; kids[0]
+pub const N_BIN: u8 = 10     // name = operator (lowercase), kids = [left, right]
+pub const N_UN: u8 = 11      // name = "not" / "-" / "+"; kids = [operand]
+pub const N_FUNC: u8 = 12    // name = function, qual = "distinct" | "*" | "", kids = arguments
+pub const N_CASE: u8 = 13    // kids = [when, then, when, then, ..., else]; name = "else" when there is an else
+pub const N_IS: u8 = 14      // name = "null" "not null" "true" "not true" "false" "not false" "distinct" "not distinct"; kids = [operand (, other)]
+pub const N_IN: u8 = 15      // name = "in" / "not in"; kids = [operand, items...]
+pub const N_BETWEEN: u8 = 16 // name = "between" / "not between"; kids = [operand, low, high]
+pub const N_ARRAY: u8 = 17   // ARRAY[...]; kids = elements
+pub const N_INDEX: u8 = 18   // a[i]; kids = [array, index]
+pub const N_DEFAULT: u8 = 19 // DEFAULT in VALUES / SET
+
+pub type Node = { kind: u8, name: String, qual: String, pos: usize, kids: List[Node] }
+
+pub fn node(kind: u8, name: String, pos: usize, kids: List[Node]) -> Node { Node(kind, name, String.from(""), pos, kids) }
+
+pub type SelItem = { expr: Node, alias: String }
+
+pub const J_FIRST: u8 = 0
+pub const J_INNER: u8 = 1
+pub const J_LEFT: u8 = 2
+pub const J_RIGHT: u8 = 3
+pub const J_FULL: u8 = 4
+pub const J_CROSS: u8 = 5
+
+/// A table in FROM. `on` is the ON condition when there is one (`has_on`).
+pub type FromItem = { table: String, alias: String, join: u8, has_on: bool, on: Node, using: List[String], pos: usize }
+
+pub type Select = {
+    distinct: bool,
+    items: List[SelItem],
+    from: List[FromItem],
+    has_where: bool,
+    cond: Node,
+    group: List[Node],
+    has_having: bool,
+    having: Node,
+    order: List[Node],
+    has_limit: bool,
+    limit: Node,
+    has_offset: bool,
+    offset: Node
+}
+
+pub type Assign = { column: String, value: Node, pos: usize }
+
+pub type Conflict = { do_nothing: bool, target: List[String], sets: List[Assign], has_where: bool, cond: Node }
+
+pub type Insert = {
+    table: String,
+    pos: usize,
+    columns: List[String],
+    rows: List[List[Node]],
+    has_conflict: bool,
+    conflict: Conflict,
+    returning: List[SelItem]
+}
+
+pub type Update = { table: String, alias: String, pos: usize, sets: List[Assign], has_where: bool, cond: Node, returning: List[SelItem] }
+
+pub type Delete = { table: String, alias: String, pos: usize, has_where: bool, cond: Node, returning: List[SelItem] }
+
+pub type Stmt =
+    | Sel(q: Select)
+    | Ins(q: Insert)
+    | Upd(q: Update)
+    | Del(q: Delete)
+
+fn unsupported(what: str, at: usize) -> sql.Error { sql.unsupported(String.from(what), at) }
+
+fn nothing() -> Node { node(N_NULL, String.from(""), 0, List.new()) }
+
+// ------------------------------------------------------------------------------- statements
+
+/// Parses one statement (a trailing `;` is allowed). `toks` ends with a `T_EOF`.
+pub fn statement(toks: List[lex.Tok]) -> Result[Stmt, sql.Error] {
+    let mut c = cursor.new(toks)
+    let r = stmt_inner(inout c)?
+    cursor.eat_op(inout c, ";")
+    if !cursor.at_end(c) { return Err(cursor.fail(c, String.from("unexpected text after the end of the statement"))) }
+    Ok(r)
+}
+
+/// Lexes and parses `text`, with `:name` parameters not rewritten (use `sql.queryfile` for those).
+pub fn parse_text(text: String) -> Result[Stmt, sql.Error] {
+    let toks = lex.lex(text)?
+    statement(toks)
+}
+
+fn stmt_inner(inout c: cursor.Cur) -> Result[Stmt, sql.Error] {
+    let t = cursor.peek(c)
+    if cursor.is_word(c, "select") { return Ok(Sel(select(inout c)?)) }
+    if cursor.is_word(c, "insert") { return Ok(Ins(insert(inout c)?)) }
+    if cursor.is_word(c, "update") { return Ok(Upd(update(inout c)?)) }
+    if cursor.is_word(c, "delete") { return Ok(Del(delete(inout c)?)) }
+    if cursor.is_word(c, "with") { return Err(unsupported("WITH (common table expressions)", t.pos)) }
+    if cursor.is_word(c, "values") { return Err(unsupported("a bare VALUES statement", t.pos)) }
+    if cursor.is_op(c, "(") { return Err(unsupported("a parenthesized query", t.pos)) }
+    if cursor.is_word(c, "merge") { return Err(unsupported("MERGE", t.pos)) }
+    Err(cursor.fail(c, String.from("expected SELECT, INSERT, UPDATE or DELETE")))
+}
+
+fn select_items(inout c: cursor.Cur) -> Result[List[SelItem], sql.Error] {
+    let mut items: List[SelItem] = List.new()
+    let mut more = true
+    while more {
+        items.push(select_item(inout c)?)
+        more = cursor.eat_op(inout c, ",")
+    }
+    Ok(items)
+}
+
+fn select_item(inout c: cursor.Cur) -> Result[SelItem, sql.Error] {
+    let at = cursor.pos(c)
+    if cursor.is_op(c, "*") {
+        cursor.bump(inout c)
+        return Ok(SelItem(Node(N_STAR, String.from("*"), String.from(""), at, List.new()), String.from("")))
+    }
+    // qual.*
+    let t = cursor.peek(c)
+    if (t.kind == lex.T_WORD || t.kind == lex.T_QUOTED) && cursor.is_op_at(c, 1, ".") && cursor.is_op_at(c, 2, "*") {
+        cursor.bump(inout c)
+        cursor.bump(inout c)
+        cursor.bump(inout c)
+        return Ok(SelItem(Node(N_STAR, String.from("*"), t.text, at, List.new()), String.from("")))
+    }
+    let e = expr(inout c, 0)?
+    let mut alias = String.from("")
+    if cursor.eat_word(inout c, "as") {
+        alias = cursor.any_name(inout c)?
+    } else {
+        let nx = cursor.peek(c)
+        if nx.kind == lex.T_QUOTED || (nx.kind == lex.T_WORD && !cursor.alias_stop(nx.text.copy())) {
+            cursor.bump(inout c)
+            alias = nx.text
+        }
+    }
+    Ok(SelItem(e, alias))
+}
+
+fn table_ref(inout c: cursor.Cur, join: u8) -> Result[FromItem, sql.Error] {
+    let at = cursor.pos(c)
+    if cursor.is_op(c, "(") { return Err(unsupported("a subquery in FROM", at)) }
+    if cursor.is_word(c, "lateral") { return Err(unsupported("LATERAL", at)) }
+    let t = cursor.peek(c)
+    if t.kind == lex.T_WORD && !cursor.reserved(t.text.copy()) && cursor.is_op_at(c, 1, "(") {
+        let mut m = String.from("the function ")
+        m.append(t.text.copy())
+        m.push_str(" in FROM")
+        return Err(sql.unsupported(m, at))
+    }
+    let table = cursor.qname(inout c)?
+    cursor.eat_op(inout c, "*")
+    let mut alias = table.copy()
+    if cursor.eat_word(inout c, "as") {
+        alias = cursor.name(inout c)?
+    } else {
+        let nx = cursor.peek(c)
+        if nx.kind == lex.T_QUOTED || (nx.kind == lex.T_WORD && !cursor.alias_stop(nx.text.copy())) {
+            cursor.bump(inout c)
+            alias = nx.text
+        }
+    }
+    if cursor.is_op(c, "(") { return Err(unsupported("a column alias list", cursor.pos(c))) }
+    if cursor.is_word(c, "tablesample") { return Err(unsupported("TABLESAMPLE", cursor.pos(c))) }
+    Ok(FromItem(table, alias, join, false, nothing(), List.new(), at))
+}
+
+fn from_clause(inout c: cursor.Cur) -> Result[List[FromItem], sql.Error] {
+    let mut out: List[FromItem] = List.new()
+    out.push(table_ref(inout c, J_FIRST)?)
+    let mut go = true
+    while go {
+        if cursor.eat_op(inout c, ",") {
+            out.push(table_ref(inout c, J_CROSS)?)
+        } else if cursor.is_word(c, "natural") {
+            return Err(unsupported("NATURAL JOIN", cursor.pos(c)))
+        } else if cursor.is_word(c, "join") || cursor.is_word(c, "inner") || cursor.is_word(c, "left") || cursor.is_word(c, "right") || cursor.is_word(c, "full") || cursor.is_word(c, "cross") {
+            let mut kind = J_INNER
+            if cursor.eat_word(inout c, "left") {
+                kind = J_LEFT
+                cursor.eat_word(inout c, "outer")
+            } else if cursor.eat_word(inout c, "right") {
+                kind = J_RIGHT
+                cursor.eat_word(inout c, "outer")
+            } else if cursor.eat_word(inout c, "full") {
+                kind = J_FULL
+                cursor.eat_word(inout c, "outer")
+            } else if cursor.eat_word(inout c, "cross") {
+                kind = J_CROSS
+            } else {
+                cursor.eat_word(inout c, "inner")
+            }
+            cursor.expect_word(inout c, "join")?
+            let mut item = table_ref(inout c, kind)?
+            if kind != J_CROSS {
+                if cursor.eat_word(inout c, "on") {
+                    item.has_on = true
+                    item.on = expr(inout c, 0)?
+                } else if cursor.eat_word(inout c, "using") {
+                    item.using = cursor.name_list(inout c)?
+                } else {
+                    return Err(cursor.fail(c, String.from("expected ON or USING")))
+                }
+            }
+            out.push(item)
+        } else {
+            go = false
+        }
+    }
+    Ok(out)
+}
+
+fn expr_list(inout c: cursor.Cur) -> Result[List[Node], sql.Error] {
+    let mut out: List[Node] = List.new()
+    let mut more = true
+    while more {
+        out.push(expr(inout c, 0)?)
+        more = cursor.eat_op(inout c, ",")
+    }
+    Ok(out)
+}
+
+fn order_list(inout c: cursor.Cur) -> Result[List[Node], sql.Error] {
+    let mut out: List[Node] = List.new()
+    let mut more = true
+    while more {
+        let e = expr(inout c, 0)?
+        if cursor.eat_word(inout c, "asc") {
+            let ignore = true
+        } else if cursor.eat_word(inout c, "desc") {
+            let ignore = true
+        } else if cursor.is_word(c, "using") {
+            return Err(unsupported("ORDER BY ... USING", cursor.pos(c)))
+        }
+        if cursor.eat_word(inout c, "nulls") {
+            if !(cursor.eat_word(inout c, "first") || cursor.eat_word(inout c, "last")) {
+                return Err(cursor.fail(c, String.from("expected FIRST or LAST")))
+            }
+        }
+        out.push(e)
+        more = cursor.eat_op(inout c, ",")
+    }
+    Ok(out)
+}
+
+fn select(inout c: cursor.Cur) -> Result[Select, sql.Error] {
+    cursor.expect_word(inout c, "select")?
+    let mut q = Select(false, List.new(), List.new(), false, nothing(), List.new(), false, nothing(), List.new(), false, nothing(), false, nothing())
+    if cursor.eat_word(inout c, "distinct") {
+        if cursor.is_word(c, "on") { return Err(unsupported("DISTINCT ON", cursor.pos(c))) }
+        q.distinct = true
+    } else {
+        cursor.eat_word(inout c, "all")
+    }
+    q.items = select_items(inout c)?
+    if cursor.is_word(c, "into") { return Err(unsupported("SELECT INTO", cursor.pos(c))) }
+    if cursor.eat_word(inout c, "from") { q.from = from_clause(inout c)? }
+    if cursor.eat_word(inout c, "where") {
+        q.has_where = true
+        q.cond = expr(inout c, 0)?
+    }
+    if cursor.is_word(c, "group") {
+        cursor.bump(inout c)
+        cursor.expect_word(inout c, "by")?
+        q.group = expr_list(inout c)?
+    }
+    if cursor.eat_word(inout c, "having") {
+        q.has_having = true
+        q.having = expr(inout c, 0)?
+    }
+    if cursor.is_word(c, "window") { return Err(unsupported("WINDOW", cursor.pos(c))) }
+    if cursor.is_word(c, "union") || cursor.is_word(c, "intersect") || cursor.is_word(c, "except") {
+        return Err(unsupported("UNION, INTERSECT and EXCEPT", cursor.pos(c)))
+    }
+    if cursor.is_word(c, "order") {
+        cursor.bump(inout c)
+        cursor.expect_word(inout c, "by")?
+        q.order = order_list(inout c)?
+    }
+    let mut go = true
+    while go {
+        if cursor.eat_word(inout c, "limit") {
+            q.has_limit = true
+            if cursor.eat_word(inout c, "all") {
+                q.has_limit = false
+            } else {
+                q.limit = expr(inout c, 0)?
+            }
+        } else if cursor.eat_word(inout c, "offset") {
+            q.has_offset = true
+            q.offset = expr(inout c, 0)?
+            if !(cursor.eat_word(inout c, "row") || cursor.eat_word(inout c, "rows")) {
+                let ignore = true
+            }
+        } else if cursor.is_word(c, "fetch") {
+            return Err(unsupported("FETCH FIRST", cursor.pos(c)))
+        } else {
+            go = false
+        }
+    }
+    if cursor.is_word(c, "for") {
+        // FOR UPDATE / SHARE [OF t] [NOWAIT | SKIP LOCKED]: no effect on the shape of the rows
+        cursor.bump(inout c)
+        if !(cursor.eat_word(inout c, "update") || cursor.eat_word(inout c, "share") || (cursor.eat_word(inout c, "no") && cursor.eat_word(inout c, "key") && cursor.eat_word(inout c, "update")) || (cursor.eat_word(inout c, "key") && cursor.eat_word(inout c, "share"))) {
+            return Err(cursor.fail(c, String.from("expected UPDATE or SHARE")))
+        }
+        if cursor.eat_word(inout c, "of") {
+            let t = cursor.qname(inout c)?
+            while cursor.eat_op(inout c, ",") { let u = cursor.qname(inout c)? }
+        }
+        if cursor.eat_word(inout c, "nowait") {
+            let ignore = true
+        } else if cursor.eat_word(inout c, "skip") {
+            cursor.expect_word(inout c, "locked")?
+        }
+    }
+    Ok(q)
+}
+
+fn returning(inout c: cursor.Cur) -> Result[List[SelItem], sql.Error] {
+    if cursor.eat_word(inout c, "returning") { return select_items(inout c) }
+    Ok(List.new())
+}
+
+fn opt_alias(inout c: cursor.Cur, table: String) -> Result[String, sql.Error] {
+    let mut alias = table.copy()
+    if cursor.eat_word(inout c, "as") {
+        alias = cursor.name(inout c)?
+    } else {
+        let nx = cursor.peek(c)
+        if nx.kind == lex.T_QUOTED || (nx.kind == lex.T_WORD && !cursor.alias_stop(nx.text.copy())) {
+            cursor.bump(inout c)
+            alias = nx.text
+        }
+    }
+    Ok(alias)
+}
+
+fn insert(inout c: cursor.Cur) -> Result[Insert, sql.Error] {
+    cursor.expect_word(inout c, "insert")?
+    cursor.expect_word(inout c, "into")?
+    let at = cursor.pos(c)
+    let table = cursor.qname(inout c)?
+    let mut q = Insert(table, at, List.new(), List.new(), false, Conflict(false, List.new(), List.new(), false, nothing()), List.new())
+    if cursor.is_word(c, "as") { return Err(unsupported("an alias on the INSERT table", cursor.pos(c))) }
+    if cursor.is_op(c, "(") { q.columns = cursor.name_list(inout c)? }
+    if cursor.is_word(c, "overriding") { return Err(unsupported("OVERRIDING", cursor.pos(c))) }
+    if cursor.is_word(c, "select") || cursor.is_word(c, "with") { return Err(unsupported("INSERT ... SELECT", cursor.pos(c))) }
+    if cursor.is_word(c, "default") && cursor.is_word_at(c, 1, "values") {
+        cursor.bump(inout c)
+        cursor.bump(inout c)
+    } else {
+        cursor.expect_word(inout c, "values")?
+        let mut more = true
+        while more {
+            cursor.expect_op(inout c, "(")?
+            let mut row: List[Node] = List.new()
+            let mut inner = true
+            while inner {
+                if cursor.is_word(c, "default") {
+                    row.push(node(N_DEFAULT, String.from("default"), cursor.pos(c), List.new()))
+                    cursor.bump(inout c)
+                } else {
+                    row.push(expr(inout c, 0)?)
+                }
+                inner = cursor.eat_op(inout c, ",")
+            }
+            cursor.expect_op(inout c, ")")?
+            q.rows.push(row)
+            more = cursor.eat_op(inout c, ",")
+        }
+    }
+    if cursor.is_word(c, "on") {
+        cursor.bump(inout c)
+        cursor.expect_word(inout c, "conflict")?
+        q.has_conflict = true
+        if cursor.is_op(c, "(") {
+            q.conflict.target = cursor.name_list(inout c)?
+        } else if cursor.eat_word(inout c, "on") {
+            return Err(unsupported("ON CONFLICT ON CONSTRAINT", cursor.pos(c)))
+        }
+        if cursor.is_word(c, "where") { return Err(unsupported("a conflict target WHERE", cursor.pos(c))) }
+        cursor.expect_word(inout c, "do")?
+        if cursor.eat_word(inout c, "nothing") {
+            q.conflict.do_nothing = true
+        } else {
+            cursor.expect_word(inout c, "update")?
+            cursor.expect_word(inout c, "set")?
+            q.conflict.sets = assignments(inout c)?
+            if cursor.eat_word(inout c, "where") {
+                q.conflict.has_where = true
+                q.conflict.cond = expr(inout c, 0)?
+            }
+        }
+    }
+    q.returning = returning(inout c)?
+    Ok(q)
+}
+
+fn assignments(inout c: cursor.Cur) -> Result[List[Assign], sql.Error] {
+    let mut out: List[Assign] = List.new()
+    let mut more = true
+    while more {
+        let at = cursor.pos(c)
+        if cursor.is_op(c, "(") { return Err(unsupported("SET (a, b) = ...", at)) }
+        let col = cursor.name(inout c)?
+        cursor.expect_op(inout c, "=")?
+        if cursor.is_word(c, "default") {
+            out.push(Assign(col, node(N_DEFAULT, String.from("default"), cursor.pos(c), List.new()), at))
+            cursor.bump(inout c)
+        } else {
+            out.push(Assign(col, expr(inout c, 0)?, at))
+        }
+        more = cursor.eat_op(inout c, ",")
+    }
+    Ok(out)
+}
+
+fn update(inout c: cursor.Cur) -> Result[Update, sql.Error] {
+    cursor.expect_word(inout c, "update")?
+    cursor.eat_word(inout c, "only")
+    let at = cursor.pos(c)
+    let table = cursor.qname(inout c)?
+    let alias = opt_alias(inout c, table.copy())?
+    cursor.expect_word(inout c, "set")?
+    let mut q = Update(table, alias, at, List.new(), false, nothing(), List.new())
+    q.sets = assignments(inout c)?
+    if cursor.is_word(c, "from") { return Err(unsupported("UPDATE ... FROM", cursor.pos(c))) }
+    if cursor.eat_word(inout c, "where") {
+        q.has_where = true
+        q.cond = expr(inout c, 0)?
+    }
+    q.returning = returning(inout c)?
+    Ok(q)
+}
+
+fn delete(inout c: cursor.Cur) -> Result[Delete, sql.Error] {
+    cursor.expect_word(inout c, "delete")?
+    cursor.expect_word(inout c, "from")?
+    cursor.eat_word(inout c, "only")
+    let at = cursor.pos(c)
+    let table = cursor.qname(inout c)?
+    let alias = opt_alias(inout c, table.copy())?
+    let mut q = Delete(table, alias, at, false, nothing(), List.new())
+    if cursor.is_word(c, "using") { return Err(unsupported("DELETE ... USING", cursor.pos(c))) }
+    if cursor.eat_word(inout c, "where") {
+        q.has_where = true
+        q.cond = expr(inout c, 0)?
+    }
+    q.returning = returning(inout c)?
+    Ok(q)
+}
+
+// ------------------------------------------------------------------------------- expressions
+
+const P_OR: i32 = 1
+const P_AND: i32 = 2
+const P_NOT: i32 = 3
+const P_IS: i32 = 4
+const P_CMP: i32 = 5
+const P_LIKE: i32 = 6
+const P_OTHER: i32 = 7
+const P_ADD: i32 = 8
+const P_MUL: i32 = 9
+const P_POW: i32 = 10
+const P_AT: i32 = 11
+const P_UNARY: i32 = 12
+
+fn is_cmp(op: String) -> bool {
+    op == String.from("=") || op == String.from("<") || op == String.from(">") || op == String.from("<=") || op == String.from(">=") || op == String.from("<>") || op == String.from("!=")
+}
+
+fn bin_prec(t: lex.Tok) -> i32 {
+    if t.kind == lex.T_WORD {
+        if t.text == String.from("or") { return P_OR }
+        if t.text == String.from("and") { return P_AND }
+        if t.text == String.from("is") { return P_IS }
+        if t.text == String.from("like") || t.text == String.from("ilike") || t.text == String.from("in") || t.text == String.from("between") || t.text == String.from("similar") { return P_LIKE }
+        if t.text == String.from("at") { return P_AT }
+        return 0
+    }
+    if t.kind == lex.T_OP {
+        let o = t.text.copy()
+        if is_cmp(o.copy()) { return P_CMP }
+        if o == String.from("+") || o == String.from("-") { return P_ADD }
+        if o == String.from("*") || o == String.from("/") || o == String.from("%") { return P_MUL }
+        if o == String.from("^") { return P_POW }
+        if o == String.from("(") || o == String.from(")") || o == String.from(",") || o == String.from(";") || o == String.from(".") || o == String.from("[") || o == String.from("]") || o == String.from("::") || o == String.from(":") || o == String.from("{{") || o == String.from("}}") { return 0 }
+        return P_OTHER
+    }
+    0
+}
+
+/// Parses an expression whose operators bind at least as tightly as `min` (0 for all).
+pub fn expr(inout c: cursor.Cur, min: i32) -> Result[Node, sql.Error] {
+    cursor.enter(inout c)?
+    let r = expr_inner(inout c, min)
+    cursor.leave(inout c)
+    r
+}
+
+/// The most levels an expression tree may have (a long `a + b + c + ...` is a deep tree on the left): the checker
+/// walks the tree recursively, so hostile input must not make it deep.
+const MAX_HEIGHT: u32 = 200
+
+fn too_deep(n: Node, d: u32) -> bool {
+    if d > MAX_HEIGHT { return true }
+    for k in n.kids {
+        if too_deep(k, d + 1) { return true }
+    }
+    false
+}
+
+fn expr_inner(inout c: cursor.Cur, min: i32) -> Result[Node, sql.Error] {
+    let mut left = unary(inout c)?
+    let mut go = true
+    while go {
+        if too_deep(left.copy(), 0) { return Err(sql.error(String.from("the expression is nested too deeply"), left.pos)) }
+        let t = cursor.peek(c)
+        let mut negate = false
+        let mut word = t.copy()
+        let mut prec = bin_prec(t.copy())
+        if t.kind == lex.T_WORD && t.text == String.from("not") {
+            let nx = cursor.peek_at(c, 1)
+            if nx.kind == lex.T_WORD && (nx.text == String.from("like") || nx.text == String.from("ilike") || nx.text == String.from("in") || nx.text == String.from("between") || nx.text == String.from("similar")) {
+                negate = true
+                prec = P_LIKE
+                word = nx
+            }
+        }
+        if prec == 0 || prec < min {
+            go = false
+        } else {
+            cursor.bump(inout c)
+            if negate { cursor.bump(inout c) }
+            let at = t.pos
+            if prec == P_OR || prec == P_AND {
+                let right = expr(inout c, prec + 1)?
+                left = node(N_BIN, t.text.copy(), at, List[left, right])
+            } else if prec == P_IS {
+                left = is_rest(inout c, left, at)?
+            } else if prec == P_LIKE {
+                let w = word.text.copy()
+                if w == String.from("between") {
+                    cursor.eat_word(inout c, "symmetric")
+                    let lo = expr(inout c, P_OTHER)?
+                    cursor.expect_word(inout c, "and")?
+                    let hi = expr(inout c, P_OTHER)?
+                    let nm = if negate { String.from("not between") } else { String.from("between") }
+                    left = node(N_BETWEEN, nm, at, List[left, lo, hi])
+                } else if w == String.from("in") {
+                    cursor.expect_op(inout c, "(")?
+                    if cursor.is_word(c, "select") || cursor.is_word(c, "with") || cursor.is_word(c, "values") {
+                        return Err(unsupported("a subquery in IN", cursor.pos(c)))
+                    }
+                    let mut kids: List[Node] = List[left]
+                    let items = expr_list(inout c)?
+                    for x in items { kids.push(x) }
+                    cursor.expect_op(inout c, ")")?
+                    let nm = if negate { String.from("not in") } else { String.from("in") }
+                    left = node(N_IN, nm, at, kids)
+                } else if w == String.from("similar") {
+                    cursor.expect_word(inout c, "to")?
+                    let right = expr(inout c, P_OTHER)?
+                    let nm = if negate { String.from("not similar to") } else { String.from("similar to") }
+                    left = node(N_BIN, nm, at, List[left, right])
+                } else {
+                    let right = expr(inout c, P_OTHER)?
+                    if cursor.eat_word(inout c, "escape") {
+                        let esc = expr(inout c, P_OTHER)?
+                    }
+                    let mut nm = String.from("")
+                    if negate { nm.push_str("not ") }
+                    nm.append(w)
+                    left = node(N_BIN, nm, at, List[left, right])
+                }
+            } else if prec == P_AT {
+                cursor.expect_word(inout c, "time")?
+                cursor.expect_word(inout c, "zone")?
+                let right = expr(inout c, P_AT + 1)?
+                left = node(N_BIN, String.from("at time zone"), at, List[left, right])
+            } else if prec == P_CMP && (cursor.is_word(c, "any") || cursor.is_word(c, "some") || cursor.is_word(c, "all")) && cursor.is_op_at(c, 1, "(") {
+                let q = cursor.peek(c).text.copy()
+                cursor.bump(inout c)
+                cursor.bump(inout c)
+                if cursor.is_word(c, "select") || cursor.is_word(c, "with") { return Err(unsupported("a subquery in ANY", cursor.pos(c))) }
+                let arr = expr(inout c, 0)?
+                cursor.expect_op(inout c, ")")?
+                let mut nm = t.text.copy()
+                nm.push_str(" ")
+                if q == String.from("all") { nm.push_str("all") } else { nm.push_str("any") }
+                left = node(N_BIN, nm, at, List[left, arr])
+            } else {
+                // a left-associative binary operator; comparisons do not chain, others do
+                let right = expr(inout c, prec + 1)?
+                left = node(N_BIN, t.text.copy(), at, List[left, right])
+            }
+        }
+    }
+    Ok(left)
+}
+
+fn is_rest(inout c: cursor.Cur, left: Node, at: usize) -> Result[Node, sql.Error] {
+    let mut neg = false
+    if cursor.eat_word(inout c, "not") { neg = true }
+    let mut what = String.from("")
+    if cursor.eat_word(inout c, "null") {
+        what = String.from("null")
+    } else if cursor.eat_word(inout c, "true") {
+        what = String.from("true")
+    } else if cursor.eat_word(inout c, "false") {
+        what = String.from("false")
+    } else if cursor.eat_word(inout c, "unknown") {
+        what = String.from("unknown")
+    } else if cursor.eat_word(inout c, "distinct") {
+        cursor.expect_word(inout c, "from")?
+        let right = expr(inout c, P_OTHER)?
+        let nm = if neg { String.from("not distinct") } else { String.from("distinct") }
+        return Ok(node(N_IS, nm, at, List[left, right]))
+    } else if cursor.is_word(c, "document") || cursor.is_word(c, "normalized") || cursor.is_word(c, "json") {
+        return Err(unsupported("IS DOCUMENT, NORMALIZED and JSON", cursor.pos(c)))
+    } else {
+        return Err(cursor.fail(c, String.from("expected NULL, TRUE, FALSE or DISTINCT FROM after IS")))
+    }
+    let mut nm = String.from("")
+    if neg { nm.push_str("not ") }
+    nm.append(what)
+    Ok(node(N_IS, nm, at, List[left]))
+}
+
+fn unary(inout c: cursor.Cur) -> Result[Node, sql.Error] {
+    let t = cursor.peek(c)
+    if t.kind == lex.T_WORD && t.text == String.from("not") {
+        cursor.bump(inout c)
+        let e = expr(inout c, P_NOT + 1)?
+        return Ok(node(N_UN, String.from("not"), t.pos, List[e]))
+    }
+    if t.kind == lex.T_OP && (t.text == String.from("-") || t.text == String.from("+")) {
+        cursor.bump(inout c)
+        let e = expr(inout c, P_UNARY)?
+        return Ok(node(N_UN, t.text.copy(), t.pos, List[e]))
+    }
+    postfix(inout c)
+}
+
+fn postfix(inout c: cursor.Cur) -> Result[Node, sql.Error] {
+    let mut e = primary(inout c)?
+    let mut go = true
+    while go {
+        if cursor.is_op(c, "::") {
+            let at = cursor.pos(c)
+            cursor.bump(inout c)
+            let pt = ddl.parse_type(inout c, schema.empty())?
+            let mut n = node(N_CAST, pt.ty, at, List[e])
+            if pt.array { n.qual = String.from("[]") }
+            e = n
+        } else if cursor.is_op(c, "[") {
+            let at = cursor.pos(c)
+            cursor.bump(inout c)
+            let i = expr(inout c, 0)?
+            if cursor.is_op(c, ":") { return Err(unsupported("an array slice", cursor.pos(c))) }
+            cursor.expect_op(inout c, "]")?
+            e = node(N_INDEX, String.from("[]"), at, List[e, i])
+        } else {
+            go = false
+        }
+    }
+    Ok(e)
+}
+
+fn primary(inout c: cursor.Cur) -> Result[Node, sql.Error] {
+    let t = cursor.peek(c)
+    if t.kind == lex.T_NUM {
+        cursor.bump(inout c)
+        let mut is_int = true
+        for i in 0..t.text.len() {
+            let b = t.text.byte(i)
+            if !(b >= 48 && b <= 57) { is_int = false }
+        }
+        return Ok(node(if is_int { N_INT } else { N_NUM }, t.text, t.pos, List.new()))
+    }
+    if t.kind == lex.T_STR {
+        cursor.bump(inout c)
+        return Ok(node(N_STR, t.text, t.pos, List.new()))
+    }
+    if t.kind == lex.T_PARAM {
+        cursor.bump(inout c)
+        return Ok(node(N_PARAM, t.text, t.pos, List.new()))
+    }
+    if t.kind == lex.T_NAMED {
+        return Err(sql.error(String.from("a named parameter must be rewritten before parsing (sql.queryfile)"), t.pos))
+    }
+    if t.kind == lex.T_OP && t.text == String.from("(") {
+        cursor.bump(inout c)
+        if cursor.is_word(c, "select") || cursor.is_word(c, "with") || cursor.is_word(c, "values") {
+            return Err(unsupported("a subquery", cursor.pos(c)))
+        }
+        let e = expr(inout c, 0)?
+        if cursor.is_op(c, ",") { return Err(unsupported("a row value", cursor.pos(c))) }
+        cursor.expect_op(inout c, ")")?
+        return Ok(e)
+    }
+    if t.kind == lex.T_QUOTED {
+        return column_path(inout c)
+    }
+    if t.kind != lex.T_WORD {
+        return Err(cursor.fail(c, String.from("expected an expression")))
+    }
+    let w = t.text.copy()
+    if w == String.from("null") {
+        cursor.bump(inout c)
+        return Ok(node(N_NULL, String.from("null"), t.pos, List.new()))
+    }
+    if w == String.from("true") || w == String.from("false") {
+        cursor.bump(inout c)
+        return Ok(node(N_BOOL, w, t.pos, List.new()))
+    }
+    if w == String.from("case") { return case_expr(inout c) }
+    if w == String.from("cast") && cursor.is_op_at(c, 1, "(") {
+        cursor.bump(inout c)
+        cursor.bump(inout c)
+        let e = expr(inout c, 0)?
+        cursor.expect_word(inout c, "as")?
+        let pt = ddl.parse_type(inout c, schema.empty())?
+        cursor.expect_op(inout c, ")")?
+        let mut n = node(N_CAST, pt.ty, t.pos, List[e])
+        if pt.array { n.qual = String.from("[]") }
+        return Ok(n)
+    }
+    if w == String.from("exists") { return Err(unsupported("EXISTS", t.pos)) }
+    if w == String.from("array") {
+        cursor.bump(inout c)
+        if cursor.is_op(c, "(") { return Err(unsupported("ARRAY(subquery)", cursor.pos(c))) }
+        cursor.expect_op(inout c, "[")?
+        let mut items: List[Node] = List.new()
+        if !cursor.is_op(c, "]") { items = expr_list(inout c)? }
+        cursor.expect_op(inout c, "]")?
+        return Ok(node(N_ARRAY, String.from("array"), t.pos, items))
+    }
+    if (w == String.from("interval") || w == String.from("date") || w == String.from("time") || w == String.from("timestamp") || w == String.from("timestamptz")) && cursor.peek_at(c, 1).kind == lex.T_STR {
+        cursor.bump(inout c)
+        let s = cursor.peek(c)
+        cursor.bump(inout c)
+        let lit = node(N_STR, s.text, s.pos, List.new())
+        let ty = if w == String.from("timestamptz") { String.from("timestamptz") } else { w }
+        return Ok(node(N_CAST, ty, t.pos, List[lit]))
+    }
+    if w == String.from("extract") && cursor.is_op_at(c, 1, "(") {
+        cursor.bump(inout c)
+        cursor.bump(inout c)
+        let f = cursor.peek(c)
+        if f.kind != lex.T_WORD && f.kind != lex.T_STR { return Err(cursor.fail(c, String.from("expected a date part"))) }
+        cursor.bump(inout c)
+        cursor.expect_word(inout c, "from")?
+        let e = expr(inout c, 0)?
+        cursor.expect_op(inout c, ")")?
+        return Ok(node(N_FUNC, String.from("extract"), t.pos, List[e]))
+    }
+    if w == String.from("substring") || w == String.from("position") || w == String.from("overlay") || w == String.from("trim") || w == String.from("collation") || w == String.from("grouping") {
+        if cursor.is_op_at(c, 1, "(") {
+            // the SQL-standard forms (SUBSTRING(x FROM 2 FOR 3), TRIM(BOTH ' ' FROM x)) are read as plain calls when
+            // they use commas; the keyword forms are not read
+            let save = c.copy()
+            cursor.bump(inout c)
+            let r = call_args(inout c, w.copy(), t.pos)
+            match r {
+                Ok(n) => { return Ok(n) }
+                Err(e) => {
+                    c = save
+                    return Err(unsupported("the keyword form of this function", t.pos))
+                }
+            }
+        }
+    }
+    if w == String.from("current_date") || w == String.from("current_timestamp") || w == String.from("current_time") || w == String.from("localtimestamp") || w == String.from("localtime") || w == String.from("current_user") || w == String.from("session_user") || w == String.from("current_schema") || w == String.from("current_catalog") {
+        cursor.bump(inout c)
+        if cursor.is_op(c, "(") {
+            // current_timestamp(3)
+            cursor.skip_parens(inout c)?
+        }
+        return Ok(node(N_FUNC, w, t.pos, List.new()))
+    }
+    if cursor.reserved(w.copy()) {
+        return Err(cursor.fail(c, String.from("expected an expression")))
+    }
+    if cursor.is_op_at(c, 1, "(") {
+        cursor.bump(inout c)
+        return call_args(inout c, w, t.pos)
+    }
+    column_path(inout c)
+}
+
+fn column_path(inout c: cursor.Cur) -> Result[Node, sql.Error] {
+    let at = cursor.pos(c)
+    let first = cursor.name(inout c)?
+    if !cursor.is_op(c, ".") {
+        return Ok(Node(N_COL, first, String.from(""), at, List.new()))
+    }
+    cursor.bump(inout c)
+    if cursor.is_op(c, "*") { return Err(unsupported("`t.*` here", at)) }
+    let second = cursor.any_name(inout c)?
+    if cursor.is_op(c, ".") { return Err(unsupported("a name with three parts", cursor.pos(c))) }
+    Ok(Node(N_COL, second, first, at, List.new()))
+}
+
+/// The `(args)` of a call whose name is `fname`; the cursor is at `(`.
+fn call_args(inout c: cursor.Cur, fname: String, at: usize) -> Result[Node, sql.Error] {
+    cursor.expect_op(inout c, "(")?
+    let mut n = node(N_FUNC, fname, at, List.new())
+    if cursor.is_op(c, "*") {
+        cursor.bump(inout c)
+        n.qual = String.from("*")
+    } else if !cursor.is_op(c, ")") {
+        if cursor.eat_word(inout c, "distinct") {
+            n.qual = String.from("distinct")
+        } else {
+            cursor.eat_word(inout c, "all")
+        }
+        n.kids = expr_list(inout c)?
+        if cursor.is_word(c, "order") { return Err(unsupported("ORDER BY inside an aggregate", cursor.pos(c))) }
+    }
+    cursor.expect_op(inout c, ")")?
+    if cursor.is_word(c, "over") { return Err(unsupported("window functions (OVER)", cursor.pos(c))) }
+    if cursor.is_word(c, "filter") { return Err(unsupported("FILTER", cursor.pos(c))) }
+    if cursor.is_word(c, "within") { return Err(unsupported("WITHIN GROUP", cursor.pos(c))) }
+    Ok(n)
+}
+
+fn case_expr(inout c: cursor.Cur) -> Result[Node, sql.Error] {
+    let at = cursor.pos(c)
+    cursor.expect_word(inout c, "case")?
+    let mut operand: Option[Node] = None
+    if !cursor.is_word(c, "when") { operand = Some(expr(inout c, 0)?) }
+    let mut kids: List[Node] = List.new()
+    let mut n: usize = 0
+    while cursor.is_word(c, "when") {
+        cursor.bump(inout c)
+        let w = expr(inout c, 0)?
+        cursor.expect_word(inout c, "then")?
+        let r = expr(inout c, 0)?
+        match operand {
+            Some(o) => { kids.push(node(N_BIN, String.from("="), w.pos, List[o, w])) }
+            None => { kids.push(w) }
+        }
+        kids.push(r)
+        n += 1
+    }
+    if n == 0 { return Err(cursor.fail(c, String.from("expected WHEN"))) }
+    let mut nm = String.from("")
+    if cursor.eat_word(inout c, "else") {
+        kids.push(expr(inout c, 0)?)
+        nm = String.from("else")
+    }
+    cursor.expect_word(inout c, "end")?
+    Ok(node(N_CASE, nm, at, kids))
+}

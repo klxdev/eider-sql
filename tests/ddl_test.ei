@@ -1,0 +1,97 @@
+// The DDL reader: the schema model built from migrations, and its errors.
+
+import sql
+import sql.ddl
+import sql.schema
+
+fn run(label: str, migrations: List[str]) uses io {
+    let mut ms: List[(String, String)] = List.new()
+    let mut i = 0
+    for m in migrations {
+        ms.push(("m{i}", String.from(m)))
+        i += 1
+    }
+    print("== {label}")
+    match ddl.build(ms) {
+        Ok(s) => print(schema.describe(s))
+        Err(e) => print("error: {e.msg} @{e.pos}")
+    }
+}
+
+fn main() uses io {
+    run("create", List["""
+        CREATE TABLE users (
+            id bigserial PRIMARY KEY,
+            email text NOT NULL UNIQUE,
+            name varchar(100),
+            age int DEFAULT 18 NOT NULL,
+            score double precision,
+            created_at timestamp(3) with time zone NOT NULL DEFAULT now(),
+            tags text[] NOT NULL DEFAULT '{{}}',
+            meta jsonb,
+            balance numeric(12, 2) NOT NULL DEFAULT 0
+        );
+        CREATE INDEX users_email_idx ON users (lower(email));
+        CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS users_name ON users USING btree (name DESC NULLS LAST);
+        """])
+    run("constraints", List["""
+        CREATE TABLE a (id int, b int, PRIMARY KEY (id, b));
+        CREATE TABLE b (
+            id int GENERATED ALWAYS AS IDENTITY,
+            a_id int NOT NULL REFERENCES a ON DELETE CASCADE ON UPDATE NO ACTION,
+            c int CONSTRAINT c_pos CHECK (c > 0 AND (c < 10)) NOT NULL,
+            d int,
+            full_name text GENERATED ALWAYS AS (lower(id::text)) STORED,
+            CONSTRAINT b_pk PRIMARY KEY (id),
+            CONSTRAINT b_fk FOREIGN KEY (d) REFERENCES a (id) DEFERRABLE INITIALLY DEFERRED,
+            UNIQUE NULLS NOT DISTINCT (a_id, c),
+            CHECK (d <> c)
+        );
+        """])
+    run("alter", List["""
+        CREATE TABLE t (id int PRIMARY KEY, a text, b text);
+        ALTER TABLE t ADD COLUMN c int NOT NULL DEFAULT 0, ADD COLUMN IF NOT EXISTS d text;
+        ALTER TABLE t DROP COLUMN b;
+        ALTER TABLE t ALTER COLUMN a SET NOT NULL;
+        ALTER TABLE t ALTER COLUMN d SET DATA TYPE varchar(10) USING d::varchar;
+        ALTER TABLE t RENAME COLUMN d TO e;
+        ALTER TABLE t ADD CONSTRAINT t_u UNIQUE (a);
+        ALTER TABLE t ADD FOREIGN KEY (c) REFERENCES t(id);
+        ALTER TABLE IF EXISTS nope ADD COLUMN x int;
+        ALTER TABLE t OWNER TO someone;
+        ALTER TABLE t RENAME TO t2;
+        """])
+    run("drop", List["""
+        CREATE TABLE a (id int);
+        CREATE TABLE b (id int);
+        CREATE INDEX a_idx ON a (id);
+        DROP INDEX a_idx;
+        DROP TABLE IF EXISTS b, nothere CASCADE;
+        """])
+    run("enum", List["""
+        CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy');
+        ALTER TYPE mood ADD VALUE 'ecstatic';
+        CREATE TABLE person (id int, m mood NOT NULL, ms mood[]);
+        """])
+    run("skipped", List["""
+        CREATE EXTENSION IF NOT EXISTS pgcrypto;
+        CREATE FUNCTION f() RETURNS int AS $$ SELECT 1; $$ LANGUAGE sql;
+        CREATE VIEW v AS SELECT 1;
+        CREATE TABLE copy_of (LIKE other);
+        CREATE TABLE p2 PARTITION OF parent FOR VALUES IN (1);
+        INSERT INTO nowhere VALUES (1);
+        COMMENT ON TABLE nowhere IS 'x';
+        BEGIN; COMMIT;
+        """])
+    run("two migrations", List["CREATE TABLE a (id int);", "ALTER TABLE a ADD COLUMN x text;"])
+    run("duplicate table", List["CREATE TABLE a (id int); CREATE TABLE a (id int);"])
+    run("duplicate column", List["CREATE TABLE a (id int, id text);"])
+    run("alter missing table", List["ALTER TABLE a ADD COLUMN x int;"])
+    run("drop missing column", List["CREATE TABLE a (id int); ALTER TABLE a DROP COLUMN x;"])
+    run("index on missing column", List["CREATE TABLE a (id int); CREATE INDEX i ON a (nope);"])
+    run("syntax error", List["CREATE TABLE a (id int,, x int);"])
+    run("unterminated", List["CREATE TABLE a (id int"])
+    run("garbage", List[")))((( ;;; 'x"])
+    run("empty", List[""])
+    run("deep", List["CREATE TABLE a (id int CHECK ((((((((((((((((((((((((((((((((((((((((((((((((((((1))))))))))))))))))))))))))))))))))))))))))))))))))))))"])
+}

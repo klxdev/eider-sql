@@ -1,0 +1,24 @@
+migrated: 2
+created ids 1 2, created_at has a year: true
+get_user: 1 ada@example.org Some("Ada") None
+get_user of nobody: Decode
+find_by_email: 2, none for a stranger: true
+rename_user changed 1: Some("Robert") Some("bobby")
+rename to NULL: None None
+list_active(min 40): 1 -> bob@example.org 41 None []
+users_by_ids: 2 rows, first ada@example.org
+committed: true
+rolled back on 23503
+ada has 2 orders, bob has 0: 19.90 Some("first") None
+load_many_by: 1 keys, ada's group 2
+chunked by 2: 2 rows
+no keys: 0 rows
+totals: 1 ada@example.org 2 Some("24.90")
+totals: 2 bob@example.org 0 None
+builder: 1 rows: bob@example.org
+builder update: 1
+builder batch insert: 2 rows
+injection attempt matches 0 rows
+serializable read-only transaction ran: true
+retry ok: true
+a usage error is retryable: false

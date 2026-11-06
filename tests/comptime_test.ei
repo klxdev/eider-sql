@@ -1,0 +1,19 @@
+// The checker as a compile-time check: the migrations and the query files are embedded when the program
+// is compiled, checked by the interpreter (no database), and a problem fails the build (tests/fail/).
+
+import sql.compiletime as sqlc
+
+const CHECKED: i32 = comptime sqlc.check_all(
+    List[embed("data/migrations/001_users.sql"), embed("data/migrations/002_orders.sql")],
+    List[embed("data/queries/users.sql"), embed("data/queries/orders.sql")])
+
+const SIG_OK: bool = comptime sqlc.expect_signature(
+    List[embed("data/migrations/001_users.sql"), embed("data/migrations/002_orders.sql")],
+    List[embed("data/queries/users.sql")],
+    "FindByEmail",
+    "params: $1 text; columns: id int8; email text; name text?;")
+
+fn main() uses io {
+    print("queries checked while compiling: {CHECKED}")
+    print("signature as documented: {SIG_OK}")
+}

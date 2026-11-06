@@ -1,0 +1,76 @@
+// The dynamic query builder: the SQL and parameters it writes, and what it refuses. Values are always bound,
+// identifiers are validated and quoted, a sort column must be in the allowed list.
+
+import postgres
+import sql
+import sql.build
+import sql.ddl
+import sql.load
+import sql.schema
+
+fn show(label: str, r: Result[build.Built, sql.Error]) uses io {
+    match r {
+        Ok(b) => print("{label}\n  {b.sql}\n  params: {b.params}")
+        Err(e) => print("{label}\n  error: {e.msg}")
+    }
+}
+
+fn s(x: str) -> String { String.from(x) }
+
+fn main() uses io {
+    let sel = build.select(s("users"), build.names(List["id", "email"]))
+    show("plain select", sel.build())
+    show("filters", build.select(s("users"), build.names(List["id", "email"]))
+        .where_eq(s("active"), postgres.Bool(true))
+        .where_cmp(s("age"), build.Ge, postgres.Int(18))
+        .where_in(s("id"), load.ints(List[1, 2, 3]))
+        .where_not_null(s("email"))
+        .where_null(s("deleted_at"))
+        .order_by(s("created_at"), build.Desc)
+        .order_by(s("id"), build.Asc)
+        .limit(50)
+        .offset(100)
+        .build())
+    show("sort from the allowed list", build.select(s("users"), build.names(List["id"]))
+        .order_by_allowed(s("email"), build.Desc, build.names(List["id", "email"]))
+        .build())
+    show("sort outside the allowed list", build.select(s("users"), build.names(List["id"]))
+        .order_by_allowed(s("password_hash; DROP TABLE users"), build.Asc, build.names(List["id", "email"]))
+        .build())
+    show("injection in a value is just a value", build.select(s("users"), build.names(List["id"]))
+        .where_eq(s("email"), postgres.Text(s("x' OR '1'='1")))
+        .build())
+    show("injection in a column", build.select(s("users"), build.names(List["id"]))
+        .where_eq(s("email = 1 OR 1"), postgres.Int(1))
+        .build())
+    show("injection in a table", build.select(s("users; DROP TABLE users"), build.names(List["id"])).build())
+    show("injection in a select column", build.select(s("users"), build.names(List["id, (SELECT 1)"])).build())
+    show("quote in a name", build.select(s("us\"ers"), build.names(List["id"])).build())
+    show("no columns", build.select(s("users"), List.new()).build())
+    show("negative limit", build.select(s("users"), build.names(List["id"])).limit(-1).build())
+    show("batch insert", build.insert_into(s("users"), build.names(List["email", "name"]))
+        .row(List[postgres.Text(s("a@x")), postgres.Text(s("A"))])
+        .row(List[postgres.Text(s("b@x")), postgres.Null])
+        .returning(build.names(List["id"]))
+        .build())
+    show("insert row of the wrong length", build.insert_into(s("users"), build.names(List["email", "name"]))
+        .row(List[postgres.Text(s("a@x"))])
+        .build())
+    show("insert without rows", build.insert_into(s("users"), build.names(List["email"])).build())
+    show("update", build.update(s("users")).set(s("name"), postgres.Text(s("N"))).set(s("age"), postgres.Int(3)).where_eq(s("id"), postgres.Int(7)).returning(build.names(List["id"])).build())
+    show("update without a condition", build.update(s("users")).set(s("name"), postgres.Null).build())
+    show("update of every row, said so", build.update(s("users")).set(s("name"), postgres.Null).all_rows().build())
+    show("delete", build.delete_from(s("users")).where_in(s("id"), load.ints(List[5, 6])).build())
+    show("delete without a condition", build.delete_from(s("users")).build())
+
+    let sch = ddl.build(List[(s("init"), s("CREATE TABLE users (id bigint PRIMARY KEY, email text NOT NULL, name text);"))]).unwrap()
+    show("against the schema: fine", build.select(s("users"), build.names(List["id", "email"])).with_schema(sch.copy()).where_eq(s("name"), postgres.Text(s("x"))).build())
+    show("against the schema: a typo in a column", build.select(s("users"), build.names(List["id", "emial"])).with_schema(sch.copy()).build())
+    show("against the schema: a typo in a table", build.select(s("usres"), build.names(List["id"])).with_schema(sch.copy()).build())
+    show("against the schema: a filter on an unknown column", build.select(s("users"), build.names(List["id"])).with_schema(sch.copy()).where_eq(s("nope"), postgres.Int(1)).build())
+
+    // load.group_by
+    let g = load.group_by(List[(1, "a"), (2, "b"), (1, "c")], |p| -> i32 { let (k, v) = p
+        k })
+    print("grouped: keys {g.len()}, group 1 has {g.get(1).unwrap().len()}")
+}

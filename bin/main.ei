@@ -1,0 +1,199 @@
+//! eider-sql: check, generate and run SQL.
+//!
+//!     eider-sql check   [--migrations migrations] [--queries queries] [--out gen]
+//!     eider-sql gen     [--migrations migrations] [--queries queries] [--out gen]
+//!     eider-sql schema  [--migrations migrations]
+//!     eider-sql migrate [--migrations migrations] [--url postgres://...] [--table eider_migrations] [--dry-run]
+//!     eider-sql status  [--migrations migrations] [--url postgres://...] [--table eider_migrations]
+//!
+//! `check` parses the migrations, checks every query of the `.sql` files against the schema they build (no
+//! database), and that the generated modules in `--out` are up to date. `gen` writes the typed modules.
+//! `migrate` applies the pending migrations under an advisory lock (`--dry-run` only says what it would
+//! apply). `status` lists each migration as applied, pending or changed. The connection URL comes from `--url`,
+//! else the environment variable `EIDER_SQL_URL`, else `DATABASE_URL`. Exit codes: 0 ok, 1 problems found, 2 usage.
+
+import command
+import std.env
+import std.io
+import std.time
+import postgres
+import postgres.client
+import sql
+import sql.dburl
+import sql.migrate
+import sql.migration
+import sql.project
+import sql.schema
+
+type Dirs = {
+    @[command(help = "directory of migrations (NNN_name.sql)", default = "migrations")] migrations: String,
+    @[command(help = "directory of annotated query files", default = "queries")] queries: String,
+    @[command(help = "directory of generated modules", default = "gen")] out: String,
+}
+
+type SchemaFlags = {
+    @[command(help = "directory of migrations (NNN_name.sql)", default = "migrations")] migrations: String,
+}
+
+type DbFlags = {
+    @[command(help = "directory of migrations (NNN_name.sql)", default = "migrations")] migrations: String,
+    @[command(help = "connection URL (default: $EIDER_SQL_URL, then $DATABASE_URL)")] url: Option[String],
+    @[command(help = "the history table", default = "eider_migrations")] table: String,
+    @[command(help = "only say what would be applied")] dry_run: bool,
+}
+
+type Cmd =
+    | @[command(help = "check migrations and queries against each other; no database")] Check(flags: Dirs)
+    | @[command(help = "write the typed Eider modules for the query files")] Gen(flags: Dirs)
+    | @[command(help = "print the schema the migrations build")] Schema(flags: SchemaFlags)
+    | @[command(help = "apply the pending migrations (advisory lock, one transaction each)")] Migrate(flags: DbFlags)
+    | @[command(help = "show which migrations are applied, pending or changed")] Status(flags: DbFlags)
+
+fn fail(msgs: List[String]) -> i32 uses io {
+    for m in msgs { print(m) }
+    1
+}
+
+fn connect(f: DbFlags) -> Result[client.Conn, String] uses net, io, clock, fs {
+    let mut url = match f.url {
+        Some(u) => u
+        None => String.from("")
+    }
+    if url.len() == 0 {
+        match env.get("EIDER_SQL_URL".bytes()) {
+            Some(b) => { url = postgres.text_of(b) }
+            None => {
+                match env.get("DATABASE_URL".bytes()) {
+                    Some(b2) => { url = postgres.text_of(b2) }
+                    None => {}
+                }
+            }
+        }
+    }
+    if url.len() == 0 { return Err(String.from("no connection URL: use --url, EIDER_SQL_URL or DATABASE_URL")) }
+    let cfg = match dburl.parse(url.copy()) {
+        Ok(c) => c
+        Err(e) => { return Err(postgres.error_text(e)) }
+    }
+    match client.connect(cfg, time.after_ms(30000)) {
+        Ok(c) => Ok(c)
+        Err(e) => Err(postgres.error_text(e))
+    }
+}
+
+fn run_check(f: Dirs, write: bool) -> i32 uses io, fs {
+    let ms = match project.load_migrations(f.migrations.copy()) {
+        Ok(m) => m
+        Err(e) => { return fail(List[e]) }
+    }
+    let sch = match project.schema_of(f.migrations.copy(), ms.copy()) {
+        Ok(x) => x
+        Err(e) => { return fail(List[e]) }
+    }
+    for n in sch.notes { print("note: {n}") }
+    if write {
+        match project.gen_all(f.migrations.copy(), f.queries.copy(), f.out.copy(), false) {
+            Ok(lines) => {
+                for l in lines { print(l) }
+                return 0
+            }
+            Err(p) => { return fail(p) }
+        }
+    }
+    match project.check_queries(f.queries.copy(), sch.copy()) {
+        Ok(files) => {
+            let mut n: usize = 0
+            for c in files.copy() { n += c.queries.len() }
+            print("ok: {n} queries in {files.len()} files checked against {ms.len()} migrations")
+        }
+        Err(p) => { return fail(p) }
+    }
+    // generated modules must be current
+    match project.gen_all(f.migrations.copy(), f.queries.copy(), f.out.copy(), true) {
+        Ok(lines) => {
+            for l in lines { print(l) }
+            0
+        }
+        Err(p) => fail(p)
+    }
+}
+
+fn run_schema(f: SchemaFlags) -> i32 uses io, fs {
+    let ms = match project.load_migrations(f.migrations.copy()) {
+        Ok(m) => m
+        Err(e) => { return fail(List[e]) }
+    }
+    match project.schema_of(f.migrations.copy(), ms) {
+        Ok(sch) => {
+            io.out(schema.describe(sch).bytes())
+            0
+        }
+        Err(e) => fail(List[e])
+    }
+}
+
+fn run_migrate(f: DbFlags, apply: bool) -> i32 uses net, io, clock, fs {
+    let ms = match project.load_migrations(f.migrations.copy()) {
+        Ok(m) => m
+        Err(e) => { return fail(List[e]) }
+    }
+    let mut c = match connect(f.copy()) {
+        Ok(x) => x
+        Err(e) => { return fail(List[e]) }
+    }
+    let mut opts = migrate.options()
+    opts.table = f.table.copy()
+    let dl = time.after_ms(600000)
+    let code = if apply { migrate_up(inout c, ms, opts, f.dry_run, dl) } else { migrate_status(inout c, ms, opts, dl) }
+    c.close()
+    code
+}
+
+fn migrate_up(inout c: client.Conn, ms: List[migration.Migration], opts: migrate.Options, dry: bool, dl: time.Deadline) -> i32 uses net, io, clock {
+    let mut o = opts.copy()
+    o.dry_run = dry
+    match migrate.up(inout c, ms, o, dl) {
+        Ok(r) => {
+            let verb = if r.dry_run { "would apply" } else { "applied" }
+            for m in r.ran { print("{verb} {m.version} {m.name}") }
+            print("{r.ran.len()} {verb}, {r.already} already applied")
+            0
+        }
+        Err(e) => fail(List[postgres.error_text(e)])
+    }
+}
+
+fn migrate_status(inout c: client.Conn, ms: List[migration.Migration], opts: migrate.Options, dl: time.Deadline) -> i32 uses net, io, clock {
+    match migrate.status(inout c, ms, opts, dl) {
+        Ok(items) => {
+            let mut bad = false
+            for it in items {
+                if it.state == String.from("changed") || it.state == String.from("missing") { bad = true }
+                if it.detail.len() > 0 {
+                    print("{it.state} {it.version} {it.name}: {it.detail}")
+                } else {
+                    print("{it.state} {it.version} {it.name}")
+                }
+            }
+            if bad { 1 } else { 0 }
+        }
+        Err(e) => fail(List[postgres.error_text(e)])
+    }
+}
+
+fn main() uses net, io, clock, fs {
+    let r: Result[command.Parsed[Cmd], command.Error] = command.subcommands("eider-sql", "check, generate and run SQL", command.arguments())
+    let code = match r {
+        Ok(p) => {
+            match p.opts {
+                Check(f) => run_check(f, false)
+                Gen(f) => run_check(f, true)
+                Schema(f) => run_schema(f)
+                Migrate(f) => run_migrate(f, true)
+                Status(f) => run_migrate(f, false)
+            }
+        }
+        Err(e) => command.report(e)
+    }
+    env.exit(code)
+}

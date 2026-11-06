@@ -1,0 +1,468 @@
+//! sql.gen: writes a typed Eider module from checked queries (the sqlc design).
+//!
+//! For each query: a record for its result row (`GetUserRow`, derived `Deserialize`), a constant with
+//! the SQL (`GET_USER_SQL`), and a function (`get_user`) that takes the connection, the parameters as
+//! typed arguments (`Option[T]` where NULL is allowed) and a deadline, runs the statement through
+//! `postgres.typed` and returns `Result[Row | Option[Row] | List[Row] | u64, postgres.Error]`. The
+//! checking happened before this code was written; the generated module is plain Eider that compiles
+//! like any other. Output is deterministic (golden tests).
+
+import sql
+import sql.check
+import sql.queryfile
+import sql.schema
+
+fn s(x: str) -> String { String.from(x) }
+
+// ----------------------------------------------------------------------------- names
+
+
+fn keyword(w: String) -> bool {
+    let words = List["as", "assert", "break", "comptime", "const", "continue", "else", "export", "extern", "false", "fn", "for", "if", "impl", "import", "in", "inout", "let", "match", "module", "null", "pub", "return", "test", "trait", "true", "type", "unsafe", "uses", "var", "while", "mut", "self", "Self"]
+    for x in words { if w == s(x) { return true } }
+    false
+}
+
+/// `GetUser` and `get_user` both become `get_user`.
+pub fn snake(name: String) -> String {
+    let mut out = s("")
+    for i in 0..name.len() {
+        let b = name.byte(i)
+        if b >= 65 && b <= 90 {
+            if i > 0 {
+                let p = name.byte(i - 1)
+                let next_lower = i + 1 < name.len() && name.byte(i + 1) >= 97 && name.byte(i + 1) <= 122
+                if (p >= 97 && p <= 122) || (p >= 48 && p <= 57) || (p >= 65 && p <= 90 && next_lower) { out.push_byte(95) }
+            }
+            out.push_byte(b + 32)
+        } else {
+            out.push_byte(b)
+        }
+    }
+    out
+}
+
+/// `get_user` and `GetUser` both become `GetUser`.
+pub fn pascal(name: String) -> String {
+    let mut out = s("")
+    let mut up = true
+    for i in 0..name.len() {
+        let b = name.byte(i)
+        if b == 95 {
+            up = true
+        } else if up {
+            if b >= 97 && b <= 122 { out.push_byte(b - 32) } else { out.push_byte(b) }
+            up = false
+        } else {
+            out.push_byte(b)
+        }
+    }
+    out
+}
+
+fn upper(name: String) -> String {
+    let sn = snake(name)
+    let mut out = s("")
+    for i in 0..sn.len() {
+        let b = sn.byte(i)
+        if b >= 97 && b <= 122 { out.push_byte(b - 32) } else { out.push_byte(b) }
+    }
+    out
+}
+
+fn valid_ident(n: String) -> bool {
+    if n.len() == 0 { return false }
+    for i in 0..n.len() {
+        let b = n.byte(i)
+        let letter = (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || b == 95
+        let digit = b >= 48 && b <= 57
+        if !(letter || (digit && i > 0)) { return false }
+    }
+    true
+}
+
+/// A Rust-style name for a column or parameter that is a keyword: `type` becomes `type_`.
+fn safe(n: String) -> String {
+    if keyword(n.copy()) {
+        let mut m = n.copy()
+        m.push_str("_")
+        return m
+    }
+    n
+}
+
+// ----------------------------------------------------------------------------- types
+
+/// The Eider type of a column or parameter of SQL type `ty` (not nullable).
+fn eider_type(ty: String, array: bool, schema_enums: schema.Schema, for_param: bool, what: String, at: usize) -> Result[String, sql.Error] {
+    let mut base = s("")
+    if ty == s("bool") {
+        base = s("bool")
+    } else if ty == s("int2") {
+        base = s("i16")
+    } else if ty == s("int4") {
+        base = s("i32")
+    } else if ty == s("int8") || ty == s("oid") {
+        base = s("i64")
+    } else if ty == s("float4") || ty == s("float8") {
+        base = s("f64")
+    } else if ty == s("numeric") || ty == s("text") || ty == s("uuid") || ty == s("json") || ty == s("jsonb") {
+        base = s("String")
+    } else if ty == s("bytea") {
+        base = if for_param { s("List[u8]") } else { s("serial.Bytes") }
+    } else if ty == s("date") || ty == s("timestamp") || ty == s("timestamptz") {
+        base = s("time.DateTime")
+    } else if schema.find_enum(schema_enums, ty.copy()).is_some() {
+        base = s("String")
+    } else {
+        let mut m = what.copy()
+        m.push_str(" has the type ")
+        m.append(ty)
+        m.push_str(", which postgres.typed cannot decode or send; cast it to text in the query")
+        return Err(sql.unsupported(m, at))
+    }
+    if array {
+        let mut a = s("List[")
+        a.append(base)
+        a.push_str("]")
+        return Ok(a)
+    }
+    Ok(base)
+}
+
+/// The expression that makes a `postgres.Value` from the Eider value `e` of SQL type `ty`.
+fn to_value(ty: String, e: String) -> String {
+    let mut out = s("")
+    if ty == s("bool") {
+        out.push_str("postgres.Bool(")
+    } else if ty == s("int2") || ty == s("int4") || ty == s("int8") || ty == s("oid") {
+        out.push_str("postgres.Int(")
+        out.append(e)
+        out.push_str(" as i64)")
+        return out
+    } else if ty == s("float4") || ty == s("float8") {
+        out.push_str("postgres.Float(")
+    } else if ty == s("numeric") {
+        out.push_str("postgres.Numeric(")
+    } else if ty == s("uuid") {
+        out.push_str("postgres.Uuid(")
+    } else if ty == s("json") || ty == s("jsonb") {
+        out.push_str("postgres.Json(")
+    } else if ty == s("bytea") {
+        out.push_str("postgres.Bytes(")
+    } else if ty == s("date") {
+        out.push_str("postgres.Date(")
+    } else if ty == s("timestamp") {
+        out.push_str("postgres.Timestamp(")
+    } else if ty == s("timestamptz") {
+        out.push_str("postgres.TimestampTz(")
+    } else {
+        out.push_str("postgres.Text(")
+    }
+    out.append(e)
+    out.push_str(")")
+    out
+}
+
+// ----------------------------------------------------------------------------- literals
+
+/// `text` as an Eider string literal (escaped, with `{` and `}` doubled).
+pub fn literal(text: String) -> String {
+    let mut out = s("\"")
+    let mut i: usize = 0
+    while i < text.len() {
+        let b = text.byte(i)
+        if b >= 128 {
+            let mut n: usize = 2
+            if b >= 240 { n = 4 } else if b >= 224 { n = 3 }
+            out.append(text.slice(i, i + n))
+            i += n
+            continue
+        }
+        if b == 34 {
+            out.push_str("\\\"")
+        } else if b == 92 {
+            out.push_str("\\\\")
+        } else if b == 123 {
+            out.push_str("{{")
+        } else if b == 125 {
+            out.push_str("}}")
+        } else if b == 10 {
+            out.push_str("\\n")
+        } else if b == 9 {
+            out.push_str("\\t")
+        } else if b == 13 {
+            out.push_str("\\r")
+        } else if b < 32 || b == 127 {
+            out.push_str("\\x")
+            out.push_byte(hexd(b / 16))
+            out.push_byte(hexd(b % 16))
+        } else {
+            out.push_byte(b)
+        }
+        i += 1
+    }
+    out.push_str("\"")
+    out
+}
+
+fn hexd(n: u8) -> u8 { if n < 10 { 48 + n } else { 87 + n } }
+
+// ----------------------------------------------------------------------------- generation
+
+pub type Generated = { text: String }
+
+/// One FNV-1a 64-bit hash of the inputs, as 16 hex digits (the header of a generated file, so `check`
+/// can tell it is stale).
+pub fn fingerprint(parts: List[String]) -> String {
+    let h = hash64(parts)
+    let mut out = s("")
+    let mut k: i32 = 15
+    while k >= 0 {
+        let d = ((h >> ((k * 4) as u64)) & 15) as u8
+        out.push_byte(hexd(d))
+        k -= 1
+    }
+    out
+}
+
+/// FNV-1a 64 of the parts (each followed by a separator byte).
+pub fn hash64(parts: List[String]) -> u64 {
+    let mut h: u64 = 14695981039346656037
+    for p in parts {
+        for i in 0..p.len() {
+            h = (h ^ (p.byte(i) as u64)) *% 1099511628211
+        }
+        h = (h ^ 255) *% 1099511628211
+    }
+    h
+}
+
+/// Generates the module for `queries` of the file `label` (`users.sql`), checked against `sch` already:
+/// `infos[i]` is the `Info` of `queries[i]`. `hash` is `fingerprint` of the inputs.
+pub fn generate(label: String, hash: String, sch: schema.Schema, queries: List[queryfile.Query], infos: List[check.Info]) -> Result[String, sql.Error] {
+    let mut out = s("// Code generated by eider-sql from ")
+    out.append(label.copy())
+    out.push_str(". DO NOT EDIT.\n// inputs: ")
+    out.append(hash)
+    out.push_str("\n\nimport std.serial\nimport std.time\nimport postgres\nimport postgres.client\nimport postgres.typed\n")
+    let mut i: usize = 0
+    while i < queries.len() {
+        let one = one_query(sch.copy(), queries[i].copy(), infos[i].copy())?
+        out.push_str("\n")
+        out.append(one)
+        i += 1
+    }
+    Ok(out)
+}
+
+fn one_query(sch: schema.Schema, q: queryfile.Query, info: check.Info) -> Result[String, sql.Error] {
+    let fname = snake(q.name.copy())
+    let row = pascal(q.name.copy())
+    let mut row_name = row.copy()
+    row_name.push_str("Row")
+    let mut sql_const = upper(q.name.copy())
+    sql_const.push_str("_SQL")
+    let mut out = s("")
+    for d in q.doc.copy() {
+        if d.len() > 0 {
+            out.push_str("/// ")
+            out.append(d.copy())
+            out.push_str("\n")
+        }
+    }
+    if q.doc.len() == 0 {
+        out.push_str("/// ")
+        out.append(q.name.copy())
+        out.push_str(" (")
+        out.append(q.kind.copy())
+        out.push_str(").\n")
+    }
+    out.push_str("pub const ")
+    out.append(sql_const.copy())
+    out.push_str(": str = ")
+    out.append(literal(q.text.copy()))
+    out.push_str("\n\n")
+    // the row record
+    if info.cols.len() > 0 {
+        let mut seen: List[String] = List.new()
+        out.push_str("@[derive(Deserialize)]\npub type ")
+        out.append(row_name.copy())
+        out.push_str(" = {{\n")
+        let mut k: usize = 0
+        while k < info.cols.len() {
+            let c = info.cols[k].copy()
+            if !valid_ident(c.name.copy()) {
+                let mut m = s("the result column \"")
+                m.append(c.name.copy())
+                m.push_str("\" of ")
+                m.append(q.name.copy())
+                m.push_str(" is not a valid field name; give it an alias (AS name)")
+                return Err(sql.error(m, q.pos))
+            }
+            if seen.contains(c.name.copy()) {
+                let mut m = s("the query ")
+                m.append(q.name.copy())
+                m.push_str(" returns two columns named \"")
+                m.append(c.name.copy())
+                m.push_str("\"; give one an alias")
+                return Err(sql.error(m, q.pos))
+            }
+            seen.push(c.name.copy())
+            let mut what = s("the result column \"")
+            what.append(c.name.copy())
+            what.push_str("\" of ")
+            what.append(q.name.copy())
+            let t = eider_type(c.ty.copy(), c.array, sch.copy(), false, what, q.pos)?
+            out.push_str("    ")
+            if keyword(c.name.copy()) {
+                out.push_str("@[serial(name = ")
+                out.append(literal(c.name.copy()))
+                out.push_str(")] ")
+            }
+            out.append(safe(c.name.copy()))
+            out.push_str(": ")
+            if c.nullable {
+                out.push_str("Option[")
+                out.append(t)
+                out.push_str("]")
+            } else {
+                out.append(t)
+            }
+            if k + 1 < info.cols.len() { out.push_str(",") }
+            out.push_str("\n")
+            k += 1
+        }
+        out.push_str("}}\n\n")
+    }
+    // the function
+    let mut sig = s("pub fn ")
+    sig.append(fname.copy())
+    sig.push_str("(inout c: client.Conn")
+    let mut binds = s("")
+    let mut names: List[String] = List.new()
+    let mut k: usize = 0
+    while k < info.params.len() {
+        let p = info.params[k].copy()
+        let mut pn = if k < q.param_names.len() { q.param_names[k].copy() } else { s("p") }
+        if !valid_ident(pn.copy()) { return Err(sql.error(msg_param(pn.copy(), q.name.copy()), q.pos)) }
+        pn = safe(pn)
+        if pn == s("c") || pn == s("dl") { pn.push_str("_") }
+        if names.contains(pn.copy()) { return Err(sql.error(msg_dup(pn.copy(), q.name.copy()), q.pos)) }
+        names.push(pn.copy())
+        let mut what = s("the parameter ")
+        what.append(pn.copy())
+        what.push_str(" of ")
+        what.append(q.name.copy())
+        let t = eider_type(p.ty.copy(), p.array, sch.copy(), true, what, q.pos)?
+        sig.push_str(", ")
+        sig.append(pn.copy())
+        sig.push_str(": ")
+        let mut full = t.copy()
+        if p.nullable {
+            full = s("Option[")
+            full.append(t.copy())
+            full.push_str("]")
+        }
+        sig.append(full)
+        // the Value
+        let mut conv = s("")
+        if p.array {
+            conv = s("postgres.Array(")
+            conv.append(pn.copy())
+            conv.push_str(".map(|x| ")
+            conv.append(to_value(p.ty.copy(), s("x")))
+            conv.push_str("))")
+        } else {
+            conv = to_value(p.ty.copy(), pn.copy())
+        }
+        binds.push_str("    let v")
+        binds.append(String.from_int((k + 1) as i64))
+        binds.push_str(" = ")
+        if p.nullable {
+            binds.push_str("match ")
+            binds.append(pn.copy())
+            binds.push_str(" {{\n        Some(x) => ")
+            let inner = if p.array { conv.copy() } else { to_value(p.ty.copy(), s("x")) }
+            if p.array {
+                let mut c2 = s("postgres.Array(x.map(|y| ")
+                c2.append(to_value(p.ty.copy(), s("y")))
+                c2.push_str("))")
+                binds.append(c2)
+            } else {
+                binds.append(inner)
+            }
+            binds.push_str("\n        None => postgres.Null\n    }}\n")
+        } else {
+            binds.append(conv)
+            binds.push_str("\n")
+        }
+        k += 1
+    }
+    sig.push_str(", dl: time.Deadline) -> Result[")
+    let kind = q.kind.copy()
+    if kind == s("one") {
+        sig.append(row_name.copy())
+    } else if kind == s("opt") {
+        sig.push_str("Option[")
+        sig.append(row_name.copy())
+        sig.push_str("]")
+    } else if kind == s("many") {
+        sig.push_str("List[")
+        sig.append(row_name.copy())
+        sig.push_str("]")
+    } else {
+        sig.push_str("u64")
+    }
+    sig.push_str(", postgres.Error] uses net, io, clock {{\n")
+    out.append(sig)
+    out.append(binds)
+    if info.params.len() == 0 {
+        out.push_str("    let args: List[postgres.Value] = List.new()\n")
+    } else {
+        out.push_str("    let args: List[postgres.Value] = List[")
+        let mut j: usize = 0
+        while j < info.params.len() {
+            if j > 0 { out.push_str(", ") }
+            out.push_str("v")
+            out.append(String.from_int((j + 1) as i64))
+            j += 1
+        }
+        out.push_str("]\n")
+    }
+    if kind == s("one") {
+        out.push_str("    typed.query_one[")
+        out.append(row_name)
+        out.push_str("](inout c, ")
+    } else if kind == s("opt") {
+        out.push_str("    typed.query_opt[")
+        out.append(row_name)
+        out.push_str("](inout c, ")
+    } else if kind == s("many") {
+        out.push_str("    typed.query[")
+        out.append(row_name)
+        out.push_str("](inout c, ")
+    } else {
+        out.push_str("    c.exec(")
+    }
+    out.append(sql_const)
+    out.push_str(", args, dl)\n}}\n")
+    Ok(out)
+}
+
+fn msg_param(p: String, q: String) -> String {
+    let mut m = s("the parameter name \"")
+    m.append(p)
+    m.push_str("\" of ")
+    m.append(q)
+    m.push_str(" is not a valid Eider name")
+    m
+}
+
+fn msg_dup(p: String, q: String) -> String {
+    let mut m = s("two parameters of ")
+    m.append(q)
+    m.push_str(" are called ")
+    m.append(p)
+    m
+}

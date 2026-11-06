@@ -1,0 +1,206 @@
+// The migration runner against a real server: ordering, the history table, idempotence, dry run, status, edited and
+// missing and out-of-order migrations, a failing migration that leaves nothing behind, a migration outside a
+// transaction, and runners racing on the advisory lock.
+
+import std.time
+import postgres
+import postgres.client
+import postgres.codec
+import sql.migrate
+import sql.migration
+import sql.tests.util
+
+const T_A: str = "mt_a"
+const T_B: str = "mt_b"
+const T_HIST: str = "mt_hist"
+const T_HIST_RACE: str = "mt_hist_race"
+const T_LOG: str = "mt_log"
+const T_NEVER: str = "mt_never"
+const T_RACE: str = "mt_race"
+
+fn s(x: str) -> String { String.from(x) }
+
+fn mig(v: i64, name: str, text: str) -> migration.Migration { migration.make(v, s(name), s(text)) }
+
+fn count(inout c: client.Conn, table: str) -> i64 uses net, io, clock {
+    let rs = c.query("SELECT count(*) FROM {table}", List.new(), util.dl()).unwrap()
+    match codec.value(rs, 0, 0).unwrap() {
+        postgres.Int(n) => n
+        _ => -1
+    }
+}
+
+fn exists(inout c: client.Conn, table: str) -> bool uses net, io, clock {
+    let rs = c.query("SELECT to_regclass($1)::text", List[postgres.Text(s(table))], util.dl()).unwrap()
+    match codec.value(rs, 0, 0).unwrap() {
+        postgres.Null => false
+        _ => true
+    }
+}
+
+fn describe(r: Result[migrate.Report, postgres.Error]) -> String {
+    match r {
+        Ok(rep) => {
+            let mut names = s("")
+            for m in rep.ran {
+                names.append(String.from_int(m.version))
+                names.push_str(" ")
+            }
+            "ok: ran [{names}] already {rep.already} dry {rep.dry_run}"
+        }
+        Err(e) => "error: {e.message}"
+    }
+}
+
+fn items(r: Result[List[migrate.Item], postgres.Error]) -> String {
+    match r {
+        Ok(xs) => {
+            let mut out = s("")
+            for x in xs {
+                out.append(x.state.copy())
+                out.push_str(":")
+                out.append(String.from_int(x.version))
+                out.push_str(" ")
+            }
+            out
+        }
+        Err(e) => "error: {e.message}"
+    }
+}
+
+fn base() -> List[migration.Migration] {
+    List[
+        mig(1, "create_log", "CREATE TABLE mt_log (n int, at timestamptz DEFAULT now());\nINSERT INTO mt_log (n) VALUES (1);"),
+        mig(2, "more", "INSERT INTO mt_log (n) VALUES (2);\r\nINSERT INTO mt_log (n) VALUES (22);"),
+        mig(10, "ten", "INSERT INTO mt_log (n) VALUES (10);")
+    ]
+}
+
+fn main() uses net, io, clock, fs, threads {
+    let mut c = util.admin()
+    let dl = util.dl()
+    let z = c.simple("DROP TABLE IF EXISTS mt_log, mt_log2, mt_a, mt_b, mt_hist, mt_hist2, mt_hist3, mt_hist4, mt_race, mt_nt CASCADE", dl).unwrap()
+    let mut opts = migrate.options()
+    opts.table = s("mt_hist")
+
+    print("== file names and checksums")
+    for f in List["001_create_users.sql", "7_x.sql", "0_zero.sql", "abc.sql", "001.sql", "001_a b.sql", "001_users.txt", "99999999999999999999_big.sql"] {
+        match migration.parse_filename(s(f)) {
+            Ok(p) => {
+                let (v, n) = p
+                print("{f}: version {v} name {n}")
+            }
+            Err(e) => print("{f}: refused")
+        }
+    }
+    let same = migration.checksum(s("a\r\nb")) == migration.checksum(s("a\nb"))
+    let diff = migration.checksum(s("a\nb")) == migration.checksum(s("a\nc"))
+    print("checksum ignores CRLF: {same}; differs for other text: {!diff}")
+    match migration.order(List[mig(1, "a", "x"), mig(1, "b", "y")]) {
+        Ok(o) => print("duplicates accepted?")
+        Err(e) => print("duplicate versions: {e.msg}")
+    }
+
+    print("== plan, up, up again")
+    print(describe(migrate.plan(inout c, base(), opts.copy(), dl)))
+    print("history table created by a dry run: {exists(inout c, T_HIST)}")
+    print(items(migrate.status(inout c, base(), opts.copy(), dl)))
+    print(describe(migrate.up(inout c, base(), opts.copy(), dl)))
+    print("history rows {count(inout c, T_HIST)}, log rows {count(inout c, T_LOG)}")
+    print(describe(migrate.up(inout c, base(), opts.copy(), dl)))
+    print(items(migrate.status(inout c, base(), opts.copy(), dl)))
+    print("log rows still {count(inout c, T_LOG)}")
+
+    print("== a new migration is applied, in order")
+    let mut more = base()
+    more.push(mig(11, "eleven", "INSERT INTO mt_log (n) VALUES (11);"))
+    print(describe(migrate.plan(inout c, more.copy(), opts.copy(), dl)))
+    print(describe(migrate.up(inout c, more.copy(), opts.copy(), dl)))
+
+    print("== edited, missing, out of order, renamed")
+    let mut edited = more.copy()
+    edited[1] = mig(2, "more", "INSERT INTO mt_log (n) VALUES (2000);")
+    print(describe(migrate.up(inout c, edited.copy(), opts.copy(), dl)))
+    print(items(migrate.status(inout c, edited, opts.copy(), dl)))
+    let without = List[more[0].copy(), more[2].copy(), more[3].copy()]
+    print(describe(migrate.up(inout c, without.copy(), opts.copy(), dl)))
+    print(items(migrate.status(inout c, without, opts.copy(), dl)))
+    let renamed = List[more[0].copy(), mig(2, "other_name", "INSERT INTO mt_log (n) VALUES (2);\nINSERT INTO mt_log (n) VALUES (22);"), more[2].copy(), more[3].copy()]
+    print(describe(migrate.up(inout c, renamed, opts.copy(), dl)))
+    let mut opts2 = migrate.options()
+    opts2.table = s("mt_hist2")
+    print(describe(migrate.up(inout c, List[mig(1, "one", "SELECT 1"), mig(5, "five", "SELECT 5")], opts2.copy(), dl)))
+    print(describe(migrate.up(inout c, List[mig(1, "one", "SELECT 1"), mig(3, "three", "SELECT 3"), mig(5, "five", "SELECT 5")], opts2.copy(), dl)))
+    print("log rows unchanged by all of that: {count(inout c, T_LOG)}")
+
+    print("== a failing migration leaves nothing behind")
+    let mut opts3 = migrate.options()
+    opts3.table = s("mt_hist3")
+    let failing = List[
+        mig(1, "ok", "CREATE TABLE mt_a (id int);"),
+        mig(2, "bad", "CREATE TABLE mt_b (id int);\nINSERT INTO mt_b VALUES (1);\nINSERT INTO no_such_table VALUES (1);"),
+        mig(3, "never", "CREATE TABLE mt_never (id int);")
+    ]
+    print(describe(migrate.up(inout c, failing.copy(), opts3.copy(), dl)))
+    print("mt_a (migration 1) exists: {exists(inout c, T_A)}; mt_b (migration 2) exists: {exists(inout c, T_B)}; mt_never: {exists(inout c, T_NEVER)}")
+    print(items(migrate.status(inout c, failing, opts3.copy(), dl)))
+    print("usable after the failure: {c.usable()}, in a transaction: {c.in_transaction()}")
+    let lock_free = c.query("SELECT count(*) FROM pg_locks WHERE locktype = 'advisory'", List.new(), dl).unwrap()
+    print("advisory locks still held: {codec.value(lock_free, 0, 0).unwrap()}")
+
+    print("== no-transaction migrations")
+    let mut opts4 = migrate.options()
+    opts4.table = s("mt_hist4")
+    let nt = List[
+        mig(1, "table", "CREATE TABLE mt_nt (id int, v int);"),
+        mig(2, "index", "-- eider-sql: no-transaction\nCREATE INDEX CONCURRENTLY mt_nt_idx ON mt_nt (v);")
+    ]
+    print(describe(migrate.up(inout c, nt.copy(), opts4.copy(), dl)))
+    print("flag read: {nt[1].no_tx}, {nt[0].no_tx}")
+
+    print("== bad options")
+    let mut bad = migrate.options()
+    bad.table = s("x; DROP TABLE users")
+    print(describe(migrate.up(inout c, base(), bad, dl)))
+    print(describe(migrate.up(inout c, List[mig(1, "a", "SELECT 1"), mig(1, "b", "SELECT 2")], opts2.copy(), dl)))
+    c.close()
+
+    print("== runners racing on the advisory lock")
+    let mut race: List[migration.Migration] = List.new()
+    race.push(mig(1, "create", "CREATE TABLE mt_race (n int, at timestamptz DEFAULT clock_timestamp());"))
+    for i in 2..9 {
+        let mut text = s("SELECT pg_sleep(0.05); INSERT INTO mt_race (n) VALUES (")
+        text.append(String.from_int(i as i64))
+        text.push_str(");")
+        race.push(migration.make(i as i64, "step_{i}", text))
+    }
+    let mut tasks: List[Task[i64]] = List.new()
+    for w in 0..6 {
+        let ms = race.copy()
+        tasks.push(spawn(|| -> i64 {
+            let mut cc = util.admin()
+            let mut o = migrate.options()
+            o.table = s("mt_hist")
+            o.table = s("mt_hist_race")
+            let r = migrate.up(inout cc, ms.copy(), o, util.dl())
+            cc.close()
+            match r {
+                Ok(rep) => rep.ran.len() as i64
+                Err(e) => -1
+            }
+        }))
+    }
+    let mut total: i64 = 0
+    let mut failed = 0
+    for t in tasks {
+        let n = t.join()
+        if n < 0 { failed += 1 } else { total += n }
+    }
+    let mut c2 = util.admin()
+    print("runners: 6, failed {failed}, migrations run in total {total} (each exactly once: {total == 8})")
+    print("race table rows {count(inout c2, T_RACE)}, history rows {count(inout c2, T_HIST_RACE)}")
+    let dupes = c2.query("SELECT count(*) FROM (SELECT n FROM mt_race GROUP BY n HAVING count(*) > 1) d", List.new(), dl).unwrap()
+    print("migration bodies that ran twice: {codec.value(dupes, 0, 0).unwrap()}")
+    let z2 = c2.simple("DROP TABLE IF EXISTS mt_log, mt_log2, mt_a, mt_b, mt_hist, mt_hist2, mt_hist3, mt_hist4, mt_race, mt_hist_race, mt_nt CASCADE", dl).unwrap()
+    c2.close()
+}

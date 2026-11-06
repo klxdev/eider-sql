@@ -1,0 +1,37 @@
+// Helpers shared by the tests that need a PostgreSQL server (scripts/pg-up.sh starts one).
+
+import std.env
+import std.strings
+import std.time
+import postgres
+import postgres.client
+
+pub fn port() -> i32 uses io {
+    match env.get("EIDER_PG_PORT".bytes()) {
+        Some(p) => {
+            match String.from_bytes(p) {
+                Ok(s) => strings.parse_i32(s).unwrap_or(55440)
+                Err(_) => 55440
+            }
+        }
+        None => 55440
+    }
+}
+
+pub fn config() -> postgres.Config uses io {
+    let mut cfg = postgres.config("127.0.0.1", "eider", "eiderdb")
+    cfg.port = port()
+    cfg.password = Some(String.from("eider_pw"))
+    cfg.sslmode = postgres.Disable
+    cfg
+}
+
+pub fn dl() -> time.Deadline uses clock { time.after_ms(60000) }
+
+/// A connection as the superuser, or a trap with the error.
+pub fn admin() -> client.Conn uses net, io, clock, fs {
+    match client.connect(config(), dl()) {
+        Ok(c) => c
+        Err(e) => panic("cannot connect: {postgres.error_text(e)}")
+    }
+}

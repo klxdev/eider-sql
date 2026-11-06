@@ -1,0 +1,28 @@
+ok   word:select word:id op:, word:name word:from word:users word:where word:id op:= param:1 word:and word:x op:= named:who 
+ok   word:select quoted:Mixed Case op:. quoted:a"b word:from word:t 
+ok   word:select str:it's op:, str:a
+b op:, str:dollar 'quoted' op:, str:x 
+ok   word:select num:1 op:, num:2.5 op:, num:.5 op:, num:1e10 op:, num:1.5e-3 op:, num:1 op:. num:.2 
+ok   word:select word:a op::: word:int8 op:, word:b op:<> word:c op:, word:d op:>= word:e op:, word:f op:|| word:g op:, word:h op:-> str:k op:, word:i op:->> str:k 
+ok   word:select word:a op:* op:- num:1 op:, word:b op:+ op:- num:2 op:, word:c op:, word:d op:, word:e 
+ok   word:select word:a op:< op:- num:1 
+err  unterminated string literal @7
+err  unterminated quoted identifier @7
+err  unterminated /* comment @7
+err  unterminated dollar-quoted string @7
+err  unexpected `$` @7
+err  zero-length delimited identifier @7
+ok   word:select op:~ word:x op:, op:@ word:y op:, word:a op:@> word:b op:, word:a op:&& word:b 
+ok   
+ok   
+ok   word:select str:é op:, quoted:naïve op:, word:café 
+ok   word:select op:? 
+ok   word:select op:{ word:a op:} 
+comment [ name: GetUser :one] 0-21
+word [select] 22-28
+num [1] 29-30
+comment [ tail] 31-38
+eof [] 39-39
+all ascii: err unexpected character @0
+deep: 10001 tokens
+q.sql:2:2: boom

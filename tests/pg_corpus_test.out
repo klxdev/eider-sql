@@ -1,0 +1,11 @@
+-- valid queries
+-- invalid queries (both must refuse)
+-- valid but outside the checker's subset (must say unsupported)
+-- valid for the server, refused by the checker on purpose (an untyped parameter, a NOT NULL violation)
+== totals
+queries: 165
+accepted by both: 109; refused by both: 32; valid but unsupported by the checker: 20; refused on purpose: 4
+checker accepts what the server refuses: 0; checker refuses what the server accepts: 0
+parameter types: 91 of 91 agree
+result columns: names 276 of 276 agree, types 276 of 276 agree
+nullability against the table columns: 137 checked, 0 unsound, 6 more cautious than the table

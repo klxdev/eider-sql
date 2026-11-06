@@ -1,0 +1,146 @@
+//! sql.migration: the migrations themselves (pure, no database): a version, a name, the SQL text, a
+//! checksum, ordering and validation. `sql.migrate` runs them.
+//!
+//! A migration file is `<version>_<name>.sql` (`001_create_users.sql`): the version is a positive integer
+//! (zero padding is fine; 1 and 001 are the same version), the name letters, digits and `_`. Forward only:
+//! there are no down migrations. The first line `-- eider-sql: no-transaction` makes the runner execute the
+//! migration outside a transaction (for `CREATE INDEX CONCURRENTLY`).
+
+import std.strings
+import sql
+import sql.gen
+
+fn s(x: str) -> String { String.from(x) }
+
+/// `file` is the file name when the migration was read from one ("" for an embedded string).
+pub type Migration = { version: i64, name: String, text: String, checksum: String, no_tx: bool, file: String }
+
+/// "NNN_name.sql" -> (version, name).
+pub fn parse_filename(file: String) -> Result[(i64, String), sql.Error] {
+    if !strings.ends_with(file.copy(), ".sql") { return Err(bad_name(file)) }
+    let stem = file.slice(0, file.len() - 4)
+    let mut i: usize = 0
+    let mut v: i64 = 0
+    while i < stem.len() && stem.byte(i) >= 48 && stem.byte(i) <= 57 {
+        if i >= 17 { return Err(bad_name(file)) }
+        v = v * 10 + ((stem.byte(i) - 48) as i64)
+        i += 1
+    }
+    if i == 0 || v < 1 { return Err(bad_name(file)) }
+    if i >= stem.len() || stem.byte(i) != 95 { return Err(bad_name(file)) }
+    let name = stem.slice(i + 1, stem.len())
+    if name.len() == 0 { return Err(bad_name(file)) }
+    for k in 0..name.len() {
+        let b = name.byte(k)
+        let ok = (b >= 48 && b <= 57) || (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || b == 95 || b == 45
+        if !ok { return Err(bad_name(file)) }
+    }
+    Ok((v, name))
+}
+
+fn bad_name(file: String) -> sql.Error {
+    let mut m = s("a migration file is named <version>_<name>.sql (001_create_users.sql), not ")
+    m.append(file)
+    sql.error(m, sql.NOPOS)
+}
+
+/// Line endings normalized, so a checkout on another system has the same checksum.
+fn normalize(text: String) -> String {
+    let mut out = s("")
+    let mut i: usize = 0
+    while i < text.len() {
+        let b = text.byte(i)
+        if b == 13 && i + 1 < text.len() && text.byte(i + 1) == 10 {
+            i += 1
+            continue
+        }
+        if b >= 128 {
+            let mut n: usize = 2
+            if b >= 240 { n = 4 } else if b >= 224 { n = 3 }
+            out.append(text.slice(i, i + n))
+            i += n
+            continue
+        }
+        if b == 0 {
+            i += 1
+            continue
+        }
+        out.push_byte(b)
+        i += 1
+    }
+    out
+}
+
+/// The checksum of a migration's text: "fnv64:<16 hex digits>:<length>" of the text with CRLF turned into LF.
+/// It detects an edit; it is not a cryptographic hash.
+pub fn checksum(text: String) -> String {
+    let n = normalize(text)
+    let mut out = s("fnv64:")
+    out.append(gen.fingerprint(List[n.copy()]))
+    out.push_str(":")
+    out.append(String.from_int(n.len() as i64))
+    out
+}
+
+/// A migration from its file name and text.
+pub fn from_file(file: String, text: String) -> Result[Migration, sql.Error] {
+    let (v, name) = parse_filename(file)?
+    let mut m = make(v, name, text)
+    m.file = file
+    Ok(m)
+}
+
+/// A migration from parts (embedded strings: `(version, name, text)`).
+pub fn make(version: i64, name: String, text: String) -> Migration {
+    let norm = normalize(text)
+    let first = first_line(norm.copy())
+    let no_tx = strings.trim(first) == s("-- eider-sql: no-transaction")
+    Migration(version, name, norm.copy(), checksum(norm), no_tx, s(""))
+}
+
+fn first_line(t: String) -> String {
+    let mut i: usize = 0
+    while i < t.len() && t.byte(i) != 10 { i += 1 }
+    t.slice(0, i)
+}
+
+/// Sorted by version; two with the same version are an error.
+pub fn order(ms: List[Migration]) -> Result[List[Migration], sql.Error] {
+    let mut out: List[Migration] = ms.copy()
+    // insertion sort: migration lists are short
+    let mut i: usize = 1
+    while i < out.len() {
+        let mut j = i
+        while j > 0 && out[j - 1].version > out[j].version {
+            out.swap(j - 1, j)
+            j -= 1
+        }
+        i += 1
+    }
+    let mut k: usize = 1
+    while k < out.len() {
+        if out[k].version == out[k - 1].version {
+            let mut m = s("two migrations have the version ")
+            m.append(String.from_int(out[k].version))
+            m.push_str(": ")
+            m.append(out[k - 1].name.copy())
+            m.push_str(" and ")
+            m.append(out[k].name.copy())
+            return Err(sql.error(m, sql.NOPOS))
+        }
+        k += 1
+    }
+    Ok(out)
+}
+
+/// The (name, text) pairs `sql.ddl.build` takes, in version order.
+pub fn texts(ms: List[Migration]) -> List[(String, String)] {
+    let mut out: List[(String, String)] = List.new()
+    for m in ms {
+        let mut label = String.from_int(m.version)
+        label.push_str("_")
+        label.append(m.name.copy())
+        out.push((label, m.text.copy()))
+    }
+    out
+}

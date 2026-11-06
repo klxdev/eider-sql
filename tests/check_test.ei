@@ -1,0 +1,124 @@
+// The checker: parameter and column types inferred from a schema, with no database; and its errors.
+
+import sql
+import sql.check
+import sql.ddl
+import sql.schema
+
+const DDL: str = """
+CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy');
+CREATE TABLE users (
+    id bigserial PRIMARY KEY,
+    email text NOT NULL UNIQUE,
+    name varchar(100),
+    age int NOT NULL DEFAULT 18,
+    score double precision,
+    balance numeric(12,2) NOT NULL DEFAULT 0,
+    active boolean NOT NULL DEFAULT true,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    born date,
+    tags text[] NOT NULL DEFAULT '{{}}',
+    meta jsonb,
+    mood mood NOT NULL DEFAULT 'ok',
+    uid uuid NOT NULL DEFAULT gen_random_uuid()
+);
+CREATE TABLE orders (
+    id bigserial PRIMARY KEY,
+    user_id bigint NOT NULL REFERENCES users(id),
+    total numeric NOT NULL,
+    note text,
+    shipped_at timestamp,
+    qty smallint NOT NULL DEFAULT 1
+);
+"""
+
+fn run(sch: schema.Schema, q: str) uses io {
+    match check.check_text(sch.copy(), String.from(q)) {
+        Ok(i) => print("{q}\n  => {check.describe(i)}")
+        Err(e) => print("{q}\n  => error: {e.msg}")
+    }
+}
+
+fn main() uses io {
+    let sch = match ddl.build(List[(String.from("init"), String.from(DDL))]) {
+        Ok(s) => s
+        Err(e) => {
+            print("ddl error: {e.msg}")
+            return
+        }
+    }
+    // selects
+    run(sch.copy(), "SELECT id, email, name FROM users WHERE id = $1")
+    run(sch.copy(), "SELECT * FROM users WHERE email = $1 AND age > $2")
+    run(sch.copy(), "SELECT u.id AS uid, o.total, o.note FROM users u JOIN orders o ON o.user_id = u.id WHERE u.id = $1")
+    run(sch.copy(), "SELECT u.id, o.id AS oid, o.total FROM users u LEFT JOIN orders o ON o.user_id = u.id")
+    run(sch.copy(), "SELECT u.id, o.id FROM orders o RIGHT JOIN users u ON o.user_id = u.id")
+    run(sch.copy(), "SELECT count(*), sum(qty), avg(total), max(note), min(shipped_at) FROM orders")
+    run(sch.copy(), "SELECT count(*) AS n FROM users WHERE name IS NULL")
+    run(sch.copy(), "SELECT coalesce(name, 'anon') AS who, upper(email), length(email), age + 1, age * 2.5, score / 2 FROM users")
+    run(sch.copy(), "SELECT id FROM users WHERE id = ANY($1)")
+    run(sch.copy(), "SELECT id FROM users WHERE id IN ($1, $2, 3)")
+    run(sch.copy(), "SELECT id FROM users WHERE email LIKE $1 OR name ILIKE $2")
+    run(sch.copy(), "SELECT id FROM users WHERE created_at BETWEEN $1 AND $2")
+    run(sch.copy(), "SELECT id FROM users WHERE born IS NOT NULL ORDER BY born DESC, id LIMIT $1 OFFSET $2")
+    run(sch.copy(), "SELECT CASE WHEN age > 18 THEN 'adult' ELSE 'minor' END AS kind, CASE WHEN score > 1 THEN score END AS s FROM users")
+    run(sch.copy(), "SELECT id::text, $1::int8 AS x, 1::int4, now() AS ts, current_date, true, NULL AS nothing FROM users")
+    run(sch.copy(), "SELECT meta->'a' AS j, meta->>'b' AS t, meta @> $1::jsonb AS c FROM users")
+    run(sch.copy(), "SELECT tags, tags[1] AS first, array_length(tags, 1) AS n, mood FROM users WHERE mood = 'happy'")
+    run(sch.copy(), "SELECT mood, count(*) FROM users GROUP BY mood HAVING count(*) > $1")
+    run(sch.copy(), "SELECT DISTINCT user_id FROM orders ORDER BY 1")
+    run(sch.copy(), "SELECT created_at - interval '1 day' AS d, created_at - created_at AS e, born - born AS f FROM users")
+    run(sch.copy(), "SELECT date_trunc('day', created_at) AS day, extract(year FROM born) AS y FROM users")
+    run(sch.copy(), "SELECT a.id FROM users a, users b WHERE a.id = b.id")
+    run(sch.copy(), "SELECT 1 AS one, 'x' AS lit, 1.5 AS f, 'a' || 'b' AS ab")
+    // writes
+    run(sch.copy(), "INSERT INTO users (email, name, age) VALUES ($1, $2, $3)")
+    run(sch.copy(), "INSERT INTO users (email, name) VALUES ($1, $2) RETURNING id, created_at")
+    run(sch.copy(), "INSERT INTO orders (user_id, total, note) VALUES ($1, $2, $3), ($4, $5, NULL) RETURNING *")
+    run(sch.copy(), "INSERT INTO users (email) VALUES ($1) ON CONFLICT (email) DO NOTHING")
+    run(sch.copy(), "INSERT INTO users (email, name) VALUES ($1, $2) ON CONFLICT (email) DO UPDATE SET name = excluded.name, age = users.age + 1 RETURNING id")
+    run(sch.copy(), "UPDATE users SET name = $1, score = $2 WHERE id = $3")
+    run(sch.copy(), "UPDATE users SET age = age + 1 WHERE email = $1 RETURNING age")
+    run(sch.copy(), "UPDATE orders o SET note = NULL, shipped_at = now() WHERE o.id = $1")
+    run(sch.copy(), "DELETE FROM orders WHERE user_id = $1 AND total > $2")
+    run(sch.copy(), "DELETE FROM users WHERE id = $1 RETURNING id, email")
+    // errors
+    run(sch.copy(), "SELECT nope FROM users")
+    run(sch.copy(), "SELECT emial FROM users")
+    run(sch.copy(), "SELECT id FROM usrs")
+    run(sch.copy(), "SELECT id FROM users, orders")
+    run(sch.copy(), "SELECT x.id FROM users")
+    run(sch.copy(), "SELECT id FROM users WHERE id = 'abc' AND email = 5")
+    run(sch.copy(), "SELECT id FROM users WHERE age = email")
+    run(sch.copy(), "SELECT $1")
+    run(sch.copy(), "SELECT id FROM users WHERE $1 = $2")
+    run(sch.copy(), "SELECT id FROM users WHERE id = $1 AND email = $1")
+    run(sch.copy(), "SELECT id FROM users WHERE id = $2")
+    run(sch.copy(), "INSERT INTO users (name) VALUES ($1)")
+    run(sch.copy(), "INSERT INTO users (email, nope) VALUES ($1, $2)")
+    run(sch.copy(), "INSERT INTO users (email, name) VALUES ($1)")
+    run(sch.copy(), "INSERT INTO users (email, age) VALUES ($1, 'x')")
+    run(sch.copy(), "INSERT INTO users (email, age) VALUES (NULL, 1)")
+    run(sch.copy(), "UPDATE users SET nope = 1")
+    run(sch.copy(), "UPDATE users SET age = 'old'")
+    run(sch.copy(), "SELECT id FROM users WHERE name")
+    run(sch.copy(), "SELECT id FROM users LIMIT 'x'")
+    run(sch.copy(), "SELECT lower(age) FROM users")
+    run(sch.copy(), "SELECT nosuchfn(id) FROM users")
+    // unsupported, named
+    run(sch.copy(), "WITH x AS (SELECT 1) SELECT * FROM x")
+    run(sch.copy(), "SELECT id FROM users UNION SELECT id FROM orders")
+    run(sch.copy(), "SELECT id, (SELECT count(*) FROM orders) FROM users")
+    run(sch.copy(), "SELECT id FROM users WHERE id IN (SELECT user_id FROM orders)")
+    run(sch.copy(), "SELECT id FROM users WHERE EXISTS (SELECT 1)")
+    run(sch.copy(), "SELECT id FROM (SELECT 1 AS id) t")
+    run(sch.copy(), "SELECT row_number() OVER (ORDER BY id) FROM users")
+    run(sch.copy(), "SELECT unnest(tags) FROM users")
+    run(sch.copy(), "INSERT INTO users (email) SELECT 'a'")
+    run(sch.copy(), "SELECT * FROM users NATURAL JOIN orders")
+    run(sch.copy(), "TRUNCATE users")
+    run(sch.copy(), "")
+    run(sch.copy(), "SELECT")
+    run(sch.copy(), "SELECT 1 +")
+    run(sch.copy(), "SELECT ((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((1)))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))")
+}

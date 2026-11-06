@@ -1,0 +1,271 @@
+//! sql.migrate: the migration runner. Forward-only migrations (`sql.migration`) are applied in version
+//! order, each in its own transaction together with its row in the history table, under a PostgreSQL
+//! advisory lock, so runners started at the same time (several replicas on deploy) take turns and the
+//! second finds nothing left to do.
+//!
+//! ```
+//! let ms = List[migration.make(1, String.from("users"), String.from("CREATE TABLE ...")), ...]
+//! let report = migrate.up(inout c, ms, migrate.options(), dl)?       // or migrate.plan for a dry run
+//! ```
+//!
+//! The history table (`eider_migrations`: version, name, checksum, applied_at) is created on first use.
+//! Before applying anything the runner checks the history against the list: an applied migration whose text
+//! changed (its checksum), one that is missing from the list, a name that differs, or a pending migration with
+//! a version below an applied one (out of order) is an error and nothing runs. `status` reports the same
+//! without applying. A migration marked `-- eider-sql: no-transaction` runs outside a transaction and its history
+//! row is written after it, so a crash between the two leaves it unrecorded (write such a migration with
+//! `IF NOT EXISTS`).
+
+import std.time
+import postgres
+import postgres.client
+import postgres.codec
+import sql.gen
+import sql.migration
+
+fn s(x: str) -> String { String.from(x) }
+
+fn usage(msg: String) -> postgres.Error { postgres.error(postgres.Usage, msg) }
+
+pub type Options = {
+    /// The history table (an unquoted identifier; default `eider_migrations`).
+    table: String,
+    /// Only compute what would run; execute nothing, write nothing (but the history table is not created either).
+    dry_run: bool
+}
+
+pub fn options() -> Options { Options(s("eider_migrations"), false) }
+
+/// What `up` did (or, in a dry run, would do).
+pub type Report = { ran: List[migration.Migration], already: usize, dry_run: bool }
+
+/// One line of `status`.
+pub type Item = { version: i64, name: String, state: String, detail: String }
+
+type Applied = { version: i64, name: String, checksum: String }
+
+fn valid_table(t: String) -> bool {
+    if t.len() == 0 || t.len() > 63 { return false }
+    for i in 0..t.len() {
+        let b = t.byte(i)
+        let letter = (b >= 97 && b <= 122) || b == 95
+        let digit = b >= 48 && b <= 57
+        if !(letter || (digit && i > 0)) { return false }
+    }
+    true
+}
+
+fn lock_key(table: String) -> i64 {
+    let h = gen.hash64(List[s("eider-sql migrate"), table])
+    ((h >> 1) & 9223372036854775807) as i64
+}
+
+fn int_at(rs: postgres.Rows, r: usize, c: usize) -> Result[i64, postgres.Error] {
+    match codec.value(rs, r, c)? {
+        postgres.Int(n) => Ok(n)
+        _ => Err(usage(s("unexpected column type in the migration history")))
+    }
+}
+
+fn text_at(rs: postgres.Rows, r: usize, c: usize) -> Result[String, postgres.Error] {
+    match codec.value(rs, r, c)? {
+        postgres.Text(t) => Ok(t)
+        _ => Err(usage(s("unexpected column type in the migration history")))
+    }
+}
+
+fn exists(inout c: client.Conn, table: String, dl: time.Deadline) -> Result[bool, postgres.Error] uses net, io, clock {
+    let rs = c.query("SELECT to_regclass($1)::text", List[postgres.Text(table)], dl)?
+    match codec.value(rs, 0, 0)? {
+        postgres.Null => Ok(false)
+        _ => Ok(true)
+    }
+}
+
+fn read_applied(inout c: client.Conn, table: String, dl: time.Deadline) -> Result[List[Applied], postgres.Error] uses net, io, clock {
+    let mut sqlt = s("SELECT version, name, checksum FROM ")
+    sqlt.append(client.quote_ident(table))
+    sqlt.push_str(" ORDER BY version")
+    let rs = c.query(sqlt, List.new(), dl)?
+    let mut out: List[Applied] = List.new()
+    let mut i: usize = 0
+    while i < rs.rows.len() {
+        out.push(Applied(int_at(rs, i, 0)?, text_at(rs, i, 1)?, text_at(rs, i, 2)?))
+        i += 1
+    }
+    Ok(out)
+}
+
+/// Compares the history with the list. The result has one item per migration in the list (state `applied`,
+/// `pending` or `changed`) and one per applied version the list lacks (`missing`).
+fn compare(applied: List[Applied], ms: List[migration.Migration]) -> List[Item] {
+    let mut items: List[Item] = List.new()
+    for m in ms.copy() {
+        let mut found = false
+        for a in applied.copy() {
+            if a.version == m.version {
+                found = true
+                if a.checksum != m.checksum {
+                    let mut d = s("edited after it was applied (applied checksum ")
+                    d.append(a.checksum.copy())
+                    d.push_str(", now ")
+                    d.append(m.checksum.copy())
+                    d.push_str(")")
+                    items.push(Item(m.version, m.name.copy(), s("changed"), d))
+                } else if a.name != m.name {
+                    let mut d = s("applied under the name ")
+                    d.append(a.name.copy())
+                    items.push(Item(m.version, m.name.copy(), s("changed"), d))
+                } else {
+                    items.push(Item(m.version, m.name.copy(), s("applied"), s("")))
+                }
+            }
+        }
+        if !found { items.push(Item(m.version, m.name.copy(), s("pending"), s(""))) }
+    }
+    for a in applied {
+        let mut found = false
+        for m in ms.copy() { if m.version == a.version { found = true } }
+        if !found { items.push(Item(a.version, a.name.copy(), s("missing"), s("applied, but not in the list of migrations"))) }
+    }
+    items
+}
+
+/// Why the history and the list do not fit, or None.
+fn problem(items: List[Item], applied: List[Applied]) -> Option[String] {
+    let mut max_applied: i64 = 0
+    for a in applied { if a.version > max_applied { max_applied = a.version } }
+    for it in items.copy() {
+        if it.state == s("changed") || it.state == s("missing") {
+            let mut m = s("migration ")
+            m.append(String.from_int(it.version))
+            m.push_str(" (")
+            m.append(it.name.copy())
+            m.push_str("): ")
+            m.append(it.detail.copy())
+            return Some(m)
+        }
+        if it.state == s("pending") && it.version < max_applied {
+            let mut m = s("migration ")
+            m.append(String.from_int(it.version))
+            m.push_str(" (")
+            m.append(it.name.copy())
+            m.push_str(") is pending but a later version (")
+            m.append(String.from_int(max_applied))
+            m.push_str(") is already applied: migrations only go forward")
+            return Some(m)
+        }
+    }
+    None
+}
+
+/// The state of every migration against the database, without changing anything (no lock; the history table
+/// may not exist yet: everything is pending then).
+pub fn status(inout c: client.Conn, ms: List[migration.Migration], opts: Options, dl: time.Deadline) -> Result[List[Item], postgres.Error] uses net, io, clock {
+    if !valid_table(opts.table.copy()) { return Err(usage(s("the history table must be a lowercase unquoted identifier"))) }
+    let ordered = match migration.order(ms) {
+        Ok(o) => o
+        Err(e) => { return Err(usage(e.msg)) }
+    }
+    let mut applied: List[Applied] = List.new()
+    if exists(inout c, opts.table.copy(), dl)? { applied = read_applied(inout c, opts.table.copy(), dl)? }
+    Ok(compare(applied, ordered))
+}
+
+/// What `up` would do: the same checks, nothing executed (`up` with `dry_run`).
+pub fn plan(inout c: client.Conn, ms: List[migration.Migration], opts: Options, dl: time.Deadline) -> Result[Report, postgres.Error] uses net, io, clock {
+    let mut o = opts.copy()
+    o.dry_run = true
+    up(inout c, ms, o, dl)
+}
+
+/// Applies the pending migrations in version order. See the module comment.
+pub fn up(inout c: client.Conn, ms: List[migration.Migration], opts: Options, dl: time.Deadline) -> Result[Report, postgres.Error] uses net, io, clock {
+    if !valid_table(opts.table.copy()) { return Err(usage(s("the history table must be a lowercase unquoted identifier"))) }
+    let ordered = match migration.order(ms) {
+        Ok(o) => o
+        Err(e) => { return Err(usage(e.msg)) }
+    }
+    if opts.dry_run {
+        let mut applied: List[Applied] = List.new()
+        if exists(inout c, opts.table.copy(), dl)? { applied = read_applied(inout c, opts.table.copy(), dl)? }
+        let items = compare(applied.copy(), ordered.copy())
+        match problem(items.copy(), applied) {
+            Some(p) => { return Err(usage(p)) }
+            None => {}
+        }
+        return Ok(report(ordered, items, true))
+    }
+    let key = lock_key(opts.table.copy())
+    let lock = c.query("SELECT pg_advisory_lock($1)", List[postgres.Int(key)], dl)?
+    let r = run(inout c, ordered, opts.copy(), dl)
+    // the lock is held by the session: release it whatever happened (a failed transaction is rolled back by now)
+    if c.usable() {
+        let u = c.query("SELECT pg_advisory_unlock($1)", List[postgres.Int(key)], dl)
+    }
+    r
+}
+
+fn report(ordered: List[migration.Migration], items: List[Item], dry: bool) -> Report {
+    let mut ran: List[migration.Migration] = List.new()
+    let mut already: usize = 0
+    for it in items {
+        if it.state == s("pending") {
+            for m in ordered.copy() { if m.version == it.version { ran.push(m) } }
+        } else if it.state == s("applied") {
+            already += 1
+        }
+    }
+    Report(ran, already, dry)
+}
+
+fn run(inout c: client.Conn, ordered: List[migration.Migration], opts: Options, dl: time.Deadline) -> Result[Report, postgres.Error] uses net, io, clock {
+    let mut ddl = s("CREATE TABLE IF NOT EXISTS ")
+    ddl.append(client.quote_ident(opts.table.copy()))
+    ddl.push_str(" (version bigint PRIMARY KEY, name text NOT NULL, checksum text NOT NULL, applied_at timestamptz NOT NULL DEFAULT now())")
+    let z = c.execute(ddl, dl)?
+    let applied = read_applied(inout c, opts.table.copy(), dl)?
+    let items = compare(applied.copy(), ordered.copy())
+    match problem(items.copy(), applied) {
+        Some(p) => { return Err(usage(p)) }
+        None => {}
+    }
+    let rep = report(ordered.copy(), items, false)
+    let mut insert = s("INSERT INTO ")
+    insert.append(client.quote_ident(opts.table.copy()))
+    insert.push_str(" (version, name, checksum) VALUES ($1, $2, $3)")
+    for m in rep.ran.copy() {
+        let params = List[postgres.Int(m.version), postgres.Text(m.name.copy()), postgres.Text(m.checksum.copy())]
+        if m.no_tx {
+            apply_error(m.copy(), c.simple(m.text.copy(), dl))?
+            let n = c.exec(insert.copy(), params, dl)?
+        } else {
+            let text = m.text.copy()
+            let ins = insert.copy()
+            let r = client.transaction(inout c, dl, |inout t| -> Result[(), postgres.Error] {
+                let rs = t.simple(text.copy(), dl)?
+                let n = t.exec(ins.copy(), params.copy(), dl)?
+                Ok(())
+            })
+            apply_error(m.copy(), r)?
+        }
+    }
+    Ok(rep)
+}
+
+fn apply_error[T](m: migration.Migration, r: Result[T, postgres.Error]) -> Result[T, postgres.Error] {
+    match r {
+        Ok(v) => Ok(v)
+        Err(e) => {
+            let mut prefix = s("migration ")
+            prefix.append(String.from_int(m.version))
+            prefix.push_str(" (")
+            prefix.append(m.name.copy())
+            prefix.push_str(") failed: ")
+            let mut e2 = e.copy()
+            prefix.append(e.message.copy())
+            e2.message = prefix
+            Err(e2)
+        }
+    }
+}

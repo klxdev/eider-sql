@@ -1,0 +1,84 @@
+//! sql.tx: transactions on eider-postgres's `client.transaction` (commit on Ok, roll back on Err or trap), with an
+//! isolation level, a retry on serialization failures and deadlocks, and the pool.
+//!
+//! ```
+//! let r = tx.run(inout c, dl, |inout t| -> Result[i64, postgres.Error] {
+//!     let a = users.create_user(inout t, email, None, 30, dl)?
+//!     orders.add_order(inout t, a.id, total, None, dl)?.id
+//! })
+//! ```
+//!
+//! `run_isolated` sets the isolation level as the first statement of the transaction (`SET TRANSACTION ...`), so it
+//! must start the transaction: inside one already open (a nested call is a savepoint) PostgreSQL refuses it, and
+//! the error says so. `retry` re-runs the whole transaction function when the server aborts it for a
+//! serialization failure (`40001`) or a deadlock (`40P01`), up to `attempts` times, pausing a little longer each
+//! time; the function must therefore be safe to run again (only its database effects are undone).
+
+import std.time
+import postgres
+import postgres.client
+import postgres.pool
+
+pub type Isolation =
+    | ReadCommitted
+    | RepeatableRead
+    | Serializable
+
+fn level(i: Isolation) -> str {
+    match i {
+        ReadCommitted => "READ COMMITTED"
+        RepeatableRead => "REPEATABLE READ"
+        Serializable => "SERIALIZABLE"
+    }
+}
+
+/// `client.transaction`: BEGIN, `f`, COMMIT on Ok, ROLLBACK on Err or trap.
+pub fn run[T](inout c: client.Conn, dl: time.Deadline, f: fn(inout client.Conn) -> Result[T, postgres.Error]) -> Result[T, postgres.Error] uses net, io, clock {
+    client.transaction(inout c, dl, f)
+}
+
+/// A transaction at the given isolation level, optionally read-only.
+pub fn run_isolated[T](inout c: client.Conn, iso: Isolation, read_only: bool, dl: time.Deadline, f: fn(inout client.Conn) -> Result[T, postgres.Error]) -> Result[T, postgres.Error] uses net, io, clock {
+    let mut stmt = String.from("SET TRANSACTION ISOLATION LEVEL ")
+    stmt.push_str(level(iso))
+    if read_only { stmt.push_str(" READ ONLY") }
+    client.transaction(inout c, dl, |inout t| -> Result[T, postgres.Error] {
+        let z = t.execute(stmt.copy(), dl)?
+        f(inout t)
+    })
+}
+
+/// Whether the server aborted a transaction in a way that running it again may fix.
+pub fn retryable(e: postgres.Error) -> bool {
+    e.sqlstate == String.from(postgres.SERIALIZATION_FAILURE) || e.sqlstate == String.from(postgres.DEADLOCK_DETECTED)
+}
+
+/// `run` again (at most `attempts` times in all) while the failure is `retryable`. The pause grows from 5 ms,
+/// doubling, and never passes the deadline.
+pub fn retry[T](inout c: client.Conn, attempts: u32, iso: Isolation, dl: time.Deadline, f: fn(inout client.Conn) -> Result[T, postgres.Error]) -> Result[T, postgres.Error] uses net, io, clock {
+    let mut n: u32 = 1
+    let mut pause: i64 = 5
+    while true {
+        let r = run_isolated(inout c, iso, false, dl, f)
+        match r {
+            Ok(v) => { return Ok(v) }
+            Err(e) => {
+                if !retryable(e.copy()) || n >= attempts { return Err(e) }
+            }
+        }
+        if time.expired_on(time.system(), dl) { return r }
+        time.sleep_ms(pause)
+        pause = pause * 2
+        n += 1
+    }
+    r_unreachable()
+}
+
+fn r_unreachable[T]() -> Result[T, postgres.Error] {
+    Err(postgres.fail(postgres.Usage, "unreachable"))
+}
+
+/// A transaction on a connection of the pool (`pool.with` around `client.transaction`).
+pub fn with_pool[T](p: pool.Pool, dl: time.Deadline, f: fn(inout client.Conn) -> Result[T, postgres.Error]) -> Result[T, postgres.Error] uses net, io, clock, fs {
+    pool.with(p, dl, |inout c| -> Result[T, postgres.Error] { client.transaction(inout c, dl, f) })
+}

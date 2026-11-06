@@ -1,0 +1,197 @@
+// The checker against the server: for a corpus of queries (tests/data/corpus), what the checker infers with no
+// database (parameter types, result column names and types, whether it accepts the query at all) is compared with
+// what PostgreSQL itself answers to Parse/Describe on the same schema. Prints every disagreement and the totals.
+
+import std.time
+import postgres
+import postgres.client
+import postgres.codec
+import sql
+import sql.check
+import sql.ddl
+import sql.parse
+import sql.project
+import sql.queryfile
+import sql.schema
+import sql.tests.util
+
+fn s(x: str) -> String { String.from(x) }
+
+type Counts = {
+    total: i64,
+    both_ok: i64,
+    both_refuse: i64,
+    unsupported: i64,
+    stricter: i64,
+    false_accept: i64,
+    false_refuse: i64,
+    params: i64,
+    params_ok: i64,
+    cols: i64,
+    names_ok: i64,
+    types_ok: i64,
+    nullable_checked: i64,
+    unsound: i64,
+    imprecise: i64
+}
+
+fn ty_of_oid(oid: u32) -> String {
+    match schema.type_of_oid(oid) {
+        Some(p) => {
+            let (t, a) = p
+            schema.type_text(t, a)
+        }
+        None => "oid{oid}"
+    }
+}
+
+fn is_enum_ty(sch: schema.Schema, t: String) -> bool { schema.find_enum(sch, t).is_some() }
+
+/// Whether the checker's type `ty[]?` is the type the server's `oid` stands for.
+fn same_type(sch: schema.Schema, ty: String, array: bool, oid: u32) -> bool {
+    match schema.type_of_oid(oid) {
+        Some(p) => {
+            let (t, a) = p
+            t == ty && a == array
+        }
+        None => {
+            // an enum (or an array of one) has an OID of its own
+            is_enum_ty(sch.copy(), ty)
+        }
+    }
+}
+
+fn attnotnull(inout c: client.Conn, table: u32, attnum: i32) -> Option[bool] uses net, io, clock, fs {
+    let rs = c.query("SELECT attnotnull FROM pg_attribute WHERE attrelid = $1::oid AND attnum = $2::int2", List[postgres.Int(table as i64), postgres.Int(attnum as i64)], util.dl())
+    match rs {
+        Ok(r) => {
+            if r.rows.len() == 0 { return None }
+            match codec.value(r, 0, 0) {
+                Ok(v) => {
+                    match v {
+                        postgres.Bool(b) => Some(b)
+                        _ => None
+                    }
+                }
+                Err(_) => None
+            }
+        }
+        Err(_) => None
+    }
+}
+
+fn compare_file(inout c: client.Conn, sch: schema.Schema, label: str, text: String, mode: i32, inout n: Counts) uses net, io, clock, fs {
+    let qs = queryfile.parse_file(text.copy()).unwrap()
+    for q in qs {
+        n.total += 1
+        let server = c.prepare(q.text.copy(), util.dl())
+        let mine = match parse.statement(q.toks.copy()) {
+            Ok(st) => check.check(sch.copy(), st)
+            Err(e) => Err(e)
+        }
+        match (server, mine) {
+            (Ok(p), Ok(info)) => {
+                n.both_ok += 1
+                // parameters
+                if p.param_oids.len() != info.params.len() {
+                    print("{q.name}: parameter count: server {p.param_oids.len()}, checker {info.params.len()}")
+                }
+                let mut k: usize = 0
+                while k < info.params.len() && k < p.param_oids.len() {
+                    n.params += 1
+                    if same_type(sch.copy(), info.params[k].ty.copy(), info.params[k].array, p.param_oids[k]) {
+                        n.params_ok += 1
+                    } else {
+                        print("{q.name}: ${k + 1}: server {ty_of_oid(p.param_oids[k])}, checker {schema.type_text(info.params[k].ty.copy(), info.params[k].array)}")
+                    }
+                    k += 1
+                }
+                // columns
+                if p.columns.len() != info.cols.len() {
+                    print("{q.name}: column count: server {p.columns.len()}, checker {info.cols.len()}")
+                }
+                let mut j: usize = 0
+                while j < info.cols.len() && j < p.columns.len() {
+                    n.cols += 1
+                    let sc = p.columns[j].copy()
+                    let mc = info.cols[j].copy()
+                    if sc.name == mc.name {
+                        n.names_ok += 1
+                    } else {
+                        print("{q.name}: column {j + 1} name: server {sc.name}, checker {mc.name}")
+                    }
+                    if same_type(sch.copy(), mc.ty.copy(), mc.array, sc.type_oid) {
+                        n.types_ok += 1
+                    } else {
+                        print("{q.name}: column {mc.name} type: server {ty_of_oid(sc.type_oid)}, checker {schema.type_text(mc.ty.copy(), mc.array)}")
+                    }
+                    if sc.table_oid != 0 && sc.attnum > 0 {
+                        match attnotnull(inout c, sc.table_oid, sc.attnum) {
+                            Some(nn) => {
+                                n.nullable_checked += 1
+                                if !mc.nullable && !nn {
+                                    n.unsound += 1
+                                    print("{q.name}: column {mc.name}: checker says NOT NULL, the table column allows NULL")
+                                } else if mc.nullable && nn {
+                                    n.imprecise += 1
+                                }
+                            }
+                            None => {}
+                        }
+                    }
+                    j += 1
+                }
+            }
+            (Err(se), Err(me)) => {
+                if mode == 1 {
+                    print("{q.name}: both refuse (server: {se.sqlstate}; checker: {me.msg})")
+                } else {
+                    n.both_refuse += 1
+                }
+            }
+            (Ok(p), Err(me)) => {
+                if sql.is_unsupported(me.copy()) {
+                    n.unsupported += 1
+                } else if mode == 1 {
+                    print("{q.name}: expected `unsupported`, got: {me.msg}")
+                    n.false_refuse += 1
+                } else if mode == 2 {
+                    n.stricter += 1
+                } else {
+                    print("{q.name}: the server accepts it, the checker refuses: {me.msg}")
+                    n.false_refuse += 1
+                }
+            }
+            (Err(se), Ok(info)) => {
+                n.false_accept += 1
+                print("{q.name}: the checker accepts it, the server refuses ({se.sqlstate}: {se.message})")
+            }
+        }
+    }
+}
+
+fn main() uses net, io, clock, fs {
+    let mut c = util.admin()
+    let dl = util.dl()
+    let schema_sql = project.read_text(s("tests/data/corpus/schema.sql")).unwrap()
+    let z = c.simple(schema_sql.copy(), dl).unwrap()
+    let sch = ddl.apply(schema.empty(), schema_sql).unwrap()
+    let mut n = Counts(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+    print("-- valid queries")
+    compare_file(inout c, sch.copy(), "queries", project.read_text(s("tests/data/corpus/queries.sql")).unwrap(), 0, inout n)
+    print("-- invalid queries (both must refuse)")
+    let before = n.both_refuse
+    compare_file(inout c, sch.copy(), "invalid", project.read_text(s("tests/data/corpus/invalid.sql")).unwrap(), 0, inout n)
+    print("-- valid but outside the checker's subset (must say unsupported)")
+    compare_file(inout c, sch.copy(), "unsupported", project.read_text(s("tests/data/corpus/unsupported.sql")).unwrap(), 1, inout n)
+    print("-- valid for the server, refused by the checker on purpose (an untyped parameter, a NOT NULL violation)")
+    compare_file(inout c, sch.copy(), "stricter", project.read_text(s("tests/data/corpus/stricter.sql")).unwrap(), 2, inout n)
+    print("== totals")
+    print("queries: {n.total}")
+    print("accepted by both: {n.both_ok}; refused by both: {n.both_refuse}; valid but unsupported by the checker: {n.unsupported}; refused on purpose: {n.stricter}")
+    print("checker accepts what the server refuses: {n.false_accept}; checker refuses what the server accepts: {n.false_refuse}")
+    print("parameter types: {n.params_ok} of {n.params} agree")
+    print("result columns: names {n.names_ok} of {n.cols} agree, types {n.types_ok} of {n.cols} agree")
+    print("nullability against the table columns: {n.nullable_checked} checked, {n.unsound} unsound, {n.imprecise} more cautious than the table")
+    c.close()
+}
