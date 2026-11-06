@@ -1,6 +1,6 @@
 [package]
 name = "sql"
-version = "0.7.0"
+version = "0.7.1"
 eider = "0.7"
 main = "bin/main.ei"
 description = "Checked SQL for Eider: a migration runner, a DDL and query checker with no database, a generator of typed query modules (eider-sql gen), a batch loader and a typed builder for dynamic SQL, on eider-postgres (docs/design.md)"
