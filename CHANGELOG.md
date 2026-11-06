@@ -3,6 +3,15 @@
 eider-sql's versions (semver). Before 1.0 the MAJOR.MINOR is the Eider toolchain's it goes
 with (`eider` in eider.toml), the PATCH its own.
 
+## Unreleased
+
+- Consumable through git (eider-lang#222): `[deps.postgres]` is a git dependency, not a path dependency on a link into
+  `target/deps`; eider-postgres brings eider-tls and the toolchain's crypto package (Eider 0.7.6 and later).
+  `scripts/env.sh` takes eider-postgres and eider-tls from `../eider-<name>` or `$EIDER_<NAME>` through
+  `EIDER_PKG_OVERRIDE`, like eider-command. With an installed toolchain alone, `scripts/build.sh` and `scripts/test.sh`
+  work. The `[deps.postgres]` minimum must be raised to the eider-postgres release with the git and toolchain
+  dependencies (its 0.7.1 does not have them), and this release requires Eider 0.7.6.
+
 ## 0.7.1
 
 - Use `let mut` instead of the removed `var` (eider-lang#2).
