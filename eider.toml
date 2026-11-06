@@ -1,6 +1,6 @@
 [package]
 name = "sql"
-version = "0.7.1"
+version = "0.7.2"
 eider = "0.7"
 main = "bin/main.ei"
 description = "Checked SQL for Eider: a migration runner, a DDL and query checker with no database, a generator of typed query modules (eider-sql gen), a batch loader and a typed builder for dynamic SQL, on eider-postgres (docs/design.md)"
@@ -9,7 +9,7 @@ description = "Checked SQL for Eider: a migration runner, a DDL and query checke
 # toolchain's crypto package are the git and toolchain ones: its changelog).
 [deps.postgres]
 git = "https://github.com/klxdev/eider-postgres.git"
-version = "0.7.1"
+version = "0.7.2"
 uses = ["net", "io", "clock", "fs"]
 
 # The command line of the eider-sql program (main.ei).

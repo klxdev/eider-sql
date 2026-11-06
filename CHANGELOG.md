@@ -3,7 +3,7 @@
 eider-sql's versions (semver). Before 1.0 the MAJOR.MINOR is the Eider toolchain's it goes
 with (`eider` in eider.toml), the PATCH its own.
 
-## Unreleased
+## 0.7.2
 
 - Consumable through git (eider-lang#222): `[deps.postgres]` is a git dependency, not a path dependency on a link into
   `target/deps`; eider-postgres brings eider-tls and the toolchain's crypto package (Eider 0.7.6 and later).
